@@ -218,3 +218,10 @@ dev/
 metrics.json
 *use_count.txt
 *use_record.txt
+
+# ROCm builds: sources converted by hipify during the build
+*_hip.h
+*_hip.cuh
+*_hip.cpp
+*.hip
+src/kernels/zgemm/mma_earlyhip.cuh

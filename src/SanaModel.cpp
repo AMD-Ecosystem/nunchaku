@@ -2,10 +2,16 @@
 
 #include "SanaModel.h"
 #include "kernels/zgemm/zgemm.h"
+#ifdef USE_ROCM
+#include "interop/flash_api_rocm.h"
+#else
 #include "flash_api.h"
+#endif
 #include "kernels/misc_kernels.h"
 
+#ifndef USE_ROCM
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 using spdlog::fmt_lib::format;
 using namespace nunchaku;

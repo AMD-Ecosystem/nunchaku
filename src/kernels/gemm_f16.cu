@@ -1,5 +1,93 @@
 #include "gemm_f16.h"
 
+#ifdef USE_ROCM
+
+#include <cuda_runtime.h>
+
+using spdlog::fmt_lib::format;
+
+template<typename T>
+__global__ static void broadcast_bias_kernel(T *out, int ldo, const T *bias, int M, int N) {
+    const int row = blockIdx.y;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < N; col += gridDim.x * blockDim.x) {
+        out[(size_t)row * ldo + col] = bias[col];
+    }
+}
+
+// out = alpha * input @ weight^T + bias, accumulated in fp32 and rounded once, as the CUTLASS kernel does.
+Tensor gemm_f16(Tensor input,  // FP16
+                Tensor weight, // FP16
+                Tensor out,    // FP16
+                Tensor bias,
+                float alpha) {
+    auto N = weight.size(0);
+    auto K = input.size(-1);
+    auto M = input.numel() / K;
+    assert(weight.size(1) == K);
+
+    spdlog::debug("gemm_f16: M={} K={} N={}", M, K, N);
+
+    if (!out.valid()) {
+        auto out_shape = TensorShape(input.shape.dataExtent);
+        out_shape[-1]  = N;
+        out            = Tensor::empty(out_shape, input.scalar_type(), input.device());
+    }
+
+    assert(input.stride(-1) == 1);
+    assert(weight.is_contiguous());
+    assert(out.dtype() == input.scalar_type());
+    assert(out.shape[-1] == N);
+    assert(out.numel() / out.shape[-1] == M);
+    assert(out.stride(-1) == 1);
+    assert(!bias.valid() || (bias.ndims() == 1 && bias.shape[0] == N));
+
+    if (M == 0) {
+        return out;
+    }
+
+    const cudaDataType_t type = weight.dtype() == Tensor::BF16 ? CUDA_R_16BF : CUDA_R_16F;
+    const int ldo             = (int)out.stride(-2);
+
+    if (bias.valid()) {
+        dim3 grid(ceilDiv((int)N, 256), M);
+        if (weight.dtype() == Tensor::BF16) {
+            broadcast_bias_kernel<<<grid, 256, 0, getCurrentCUDAStream()>>>(
+                out.data_ptr<__nv_bfloat16>(), ldo, bias.data_ptr<__nv_bfloat16>(), M, N);
+        } else {
+            broadcast_bias_kernel<<<grid, 256, 0, getCurrentCUDAStream()>>>(
+                out.data_ptr<half>(), ldo, bias.data_ptr<half>(), M, N);
+        }
+        checkCUDA(cudaGetLastError());
+    }
+
+    const float beta = bias.valid() ? 1.0f : 0.0f;
+    auto blas        = getCUBLAS();
+    checkCUBLAS(cublasSetStream(blas->handle, getCurrentCUDAStream()));
+    checkCUBLAS(cublasGemmEx(blas->handle,
+                             CUBLAS_OP_T,
+                             CUBLAS_OP_N,
+                             N,
+                             M,
+                             K,
+                             &alpha,
+                             weight.data_ptr(),
+                             type,
+                             K,
+                             input.data_ptr(),
+                             type,
+                             (int)input.stride(-2),
+                             &beta,
+                             out.data_ptr(),
+                             type,
+                             ldo,
+                             CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT));
+
+    return out;
+}
+
+#else
+
 #include "dispatch_cutlass.h"
 
 #include <cutlass/core_io.h>
@@ -133,3 +221,5 @@ Tensor gemm_f16(Tensor input,  // FP16
 
     return out;
 }
+
+#endif

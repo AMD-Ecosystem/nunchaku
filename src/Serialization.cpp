@@ -129,7 +129,11 @@ SafeTensors::SafeTensors(const std::string &filename) {
         this->mapped = std::make_unique<MMapImplMio>(filename);
         checkCUDA(cudaHostRegister(const_cast<char *>(this->mapped->data()),
                                    this->mapped->size(),
+#ifdef USE_ROCM
+                                   hipHostRegisterPortable | hipHostRegisterReadOnly));
+#else
                                    cudaHostRegisterPortable | cudaHostRegisterReadOnly));
+#endif
         this->hostRegistered = true;
         this->memoryPinned   = true;
     };

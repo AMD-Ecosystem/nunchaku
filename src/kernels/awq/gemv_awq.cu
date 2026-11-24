@@ -52,9 +52,9 @@ __device__ __forceinline__ static void warp_reduce(float_t *psum, float (*out_sm
 #pragma unroll
     for (int i = 0; i < Num; ++i) {
         // T0 + T1 + T8 + T9 + T16 + T17 + T24 + T25 (kInterleave = 4)
-        fpsum[i] += __shfl_xor_sync(~0, fpsum[i], 16);
-        fpsum[i] += __shfl_xor_sync(~0, fpsum[i], 8);
-        fpsum[i] += __shfl_xor_sync(~0, fpsum[i], 1);
+        fpsum[i] += shfl_xor_warp(fpsum[i], 16);
+        fpsum[i] += shfl_xor_warp(fpsum[i], 8);
+        fpsum[i] += shfl_xor_warp(fpsum[i], 1);
     }
     __syncthreads();
     int warp = threadIdx.x / WarpSize, lane = threadIdx.x % WarpSize;

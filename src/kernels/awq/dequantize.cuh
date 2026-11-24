@@ -13,6 +13,7 @@ https://github.com/NVIDIA/FasterTransformer/blob/main/src/fastertransformer/cutl
 
 #include <cuda_fp16.h>
 #include <cstdint>
+#include "../utils.cuh"
 
 __forceinline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uint4 *result) {
 
@@ -33,6 +34,13 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uin
     // Shift right by 8 to now consider elt_45 and elt_67. Issue first to hide RAW dependency if we issue
     // immediately before required.
     const uint32_t top_i4s = i4s >> 8;
+#ifdef USE_ROCM
+    // lop3 with this immLut is (a & b) | c.
+    h[0] = (i4s & BOTTOM_MASK) | I4s_TO_F16s_MAGIC_NUM;
+    h[1] = (i4s & TOP_MASK) | I4s_TO_F16s_MAGIC_NUM;
+    h[2] = (top_i4s & BOTTOM_MASK) | I4s_TO_F16s_MAGIC_NUM;
+    h[3] = (top_i4s & TOP_MASK) | I4s_TO_F16s_MAGIC_NUM;
+#else
     // Extract elt_01 - (i4s & 0x000f000f) | 0x64006400
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(h[0])
@@ -49,6 +57,7 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uin
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(h[3])
                  : "r"(top_i4s), "n"(TOP_MASK), "n"(I4s_TO_F16s_MAGIC_NUM), "n"(immLut));
+#endif
 
     // I use inline PTX below because I am not sure if the compiler will emit float2half instructions if I use the
     // half2 ctor. In this case, I chose performance reliability over code readability.
@@ -65,6 +74,16 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uin
     static constexpr uint32_t NEG_64 = 0xd400d400;
 
     // Finally, we construct the output numbers.
+#ifdef USE_ROCM
+    half2 *hh                 = reinterpret_cast<half2 *>(h);
+    const half2 fp16_top      = bit_copy<half2>(FP16_TOP_MAGIC_NUM);
+    const half2 one_sixteenth = bit_copy<half2>(ONE_SIXTEENTH);
+    const half2 neg_64        = bit_copy<half2>(NEG_64);
+    hh[0]                     = __hsub2(hh[0], fp16_top);
+    hh[1]                     = __hfma2(hh[1], one_sixteenth, neg_64);
+    hh[2]                     = __hsub2(hh[2], fp16_top);
+    hh[3]                     = __hfma2(hh[3], one_sixteenth, neg_64);
+#else
     // Convert elt_01
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[0]) : "r"(h[0]), "r"(FP16_TOP_MAGIC_NUM));
     // Convert elt_23
@@ -73,6 +92,7 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(half2 const &source, uin
     asm volatile("sub.f16x2 %0, %1, %2;\n" : "=r"(h[2]) : "r"(h[2]), "r"(FP16_TOP_MAGIC_NUM));
     // Convert elt_67
     asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(ONE_SIXTEENTH), "r"(NEG_64));
+#endif
 }
 
 __forceinline__ __device__ void dequantize_s4_to_fp16x2(__nv_bfloat162 const &source, uint4 *result) {
@@ -97,6 +117,13 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(__nv_bfloat162 const &so
     static constexpr uint32_t MASK                   = 0x000f000f;
     static constexpr uint32_t I4s_TO_BF16s_MAGIC_NUM = 0x43004300;
 
+#ifdef USE_ROCM
+    // lop3 with this immLut is (a & b) | c.
+    h[0] = (i4s & MASK) | I4s_TO_BF16s_MAGIC_NUM;
+    h[1] = ((i4s >> 4) & MASK) | I4s_TO_BF16s_MAGIC_NUM;
+    h[2] = ((i4s >> 8) & MASK) | I4s_TO_BF16s_MAGIC_NUM;
+    h[3] = ((i4s >> 12) & MASK) | I4s_TO_BF16s_MAGIC_NUM;
+#else
     // Extract elt_01 - (i4s & 0x000f000f) | 0x43004300
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(h[0])
@@ -113,6 +140,7 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(__nv_bfloat162 const &so
     asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                  : "=r"(h[3])
                  : "r"(i4s >> 12), "n"(MASK), "n"(I4s_TO_BF16s_MAGIC_NUM), "n"(immLut));
+#endif
 
     // static constexpr uint32_t BF16_BIAS = 0xC308C308;
     // This is the BF16 {-128, -128} represented as an integer, we do not need to map to [-8, 7]
@@ -120,6 +148,15 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(__nv_bfloat162 const &so
     static constexpr uint32_t BF16_ONE  = 0x3F803F80;
 
     // Finally, we construct the output numbers.
+#ifdef USE_ROCM
+    __nv_bfloat162 *hh        = reinterpret_cast<__nv_bfloat162 *>(h);
+    const __nv_bfloat162 one  = bit_copy<__nv_bfloat162>(BF16_ONE);
+    const __nv_bfloat162 bias = bit_copy<__nv_bfloat162>(BF16_BIAS);
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        hh[i] = __hfma2(hh[i], one, bias);
+    }
+#else
     // Convert elt_01
     asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[0]) : "r"(h[0]), "r"(BF16_ONE), "r"(BF16_BIAS));
     // Convert elt_23
@@ -128,4 +165,5 @@ __forceinline__ __device__ void dequantize_s4_to_fp16x2(__nv_bfloat162 const &so
     asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[2]) : "r"(h[2]), "r"(BF16_ONE), "r"(BF16_BIAS));
     // Convert elt_67
     asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(h[3]) : "r"(h[3]), "r"(BF16_ONE), "r"(BF16_BIAS));
+#endif
 }

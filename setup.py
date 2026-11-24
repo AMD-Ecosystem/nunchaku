@@ -25,6 +25,26 @@ class CustomBuildExtension(BuildExtension):
         super().build_extensions()
 
 
+def get_rocm_arch_targets() -> list[str]:
+    archs = os.getenv("PYTORCH_ROCM_ARCH")
+    if archs:
+        return [arch for arch in re.split(r"[;\s]+", archs) if arch]
+
+    install_mode = os.getenv("NUNCHAKU_INSTALL_MODE", "FAST")
+    if install_mode == "FAST":
+        ret = []
+        if torch.cuda.is_available():
+            torch.cuda.init()
+        for i in range(torch.cuda.device_count()):
+            arch = torch.cuda.get_device_properties(i).gcnArchName.split(":")[0]
+            if arch not in ret:
+                ret.append(arch)
+    else:
+        assert install_mode == "ALL"
+        ret = ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx1201"]
+    return ret
+
+
 def get_sm_targets() -> list[str]:
     nvcc_path = os.path.join(CUDA_HOME, "bin/nvcc") if CUDA_HOME else "nvcc"
     try:
@@ -73,8 +93,18 @@ if __name__ == "__main__":
     cuda_version = torch.version.cuda  # e.g., "12.4"
     if "dev" in version:
         version = version + date.today().strftime("%Y%m%d")
-    # Version format: 1.2.0+cu12.4torch2.4
-    version = f"{version}+cu{cuda_version}torch{torch_major_minor_version}"
+    IS_ROCM = torch.version.hip is not None
+    if IS_ROCM:
+        # Version format: 1.2.0+rocm7.1torch2.9
+        torch_local = torch.__version__.split("+")[1] if "+" in torch.__version__ else ""
+        if torch_local.startswith("rocm"):
+            rocm_version = ".".join(torch_local[len("rocm") :].split(".")[:2])
+        else:
+            rocm_version = ".".join(torch.version.hip.split(".")[:2])
+        version = f"{version}+rocm{rocm_version}torch{torch_major_minor_version}"
+    else:
+        # Version format: 1.2.0+cu12.4torch2.4
+        version = f"{version}+cu{cuda_version}torch{torch_major_minor_version}"
 
     ROOT_DIR = os.path.dirname(__file__)
 
@@ -87,6 +117,13 @@ if __name__ == "__main__":
         "third_party/Block-Sparse-Attention/csrc/block_sparse_attn",
     ]
 
+    THIRD_PARTY_FLAGS = []
+    if IS_ROCM:
+        # CUTLASS and Block-Sparse-Attention have no ROCm build. The header-only libraries are passed as flags
+        # rather than include directories, so that hipify does not write converted copies into the submodules.
+        THIRD_PARTY_FLAGS = [f"-I{os.path.abspath(os.path.join(ROOT_DIR, d))}" for d in INCLUDE_DIRS[2:5]]
+        INCLUDE_DIRS = INCLUDE_DIRS[:1]
+
     INCLUDE_DIRS = [os.path.join(ROOT_DIR, dir) for dir in INCLUDE_DIRS]
 
     DEBUG = False
@@ -97,16 +134,26 @@ if __name__ == "__main__":
         else:
             return [s]
 
+    def is_cuda_only_source(s) -> bool:
+        # Block-Sparse-Attention and the unused CUTLASS W8A8 GEMM have no ROCm build.
+        return s.startswith("third_party/Block-Sparse-Attention/") or s == "src/kernels/gemm_w8a8.cu"
+
     def cond(s) -> list:
         if DEBUG:
             return [s]
         else:
             return []
 
-    sm_targets = get_sm_targets()
-    print(f"Detected SM targets: {sm_targets}", file=sys.stderr)
+    if IS_ROCM:
+        sm_targets = get_rocm_arch_targets()
+        print(f"Detected ROCm architectures: {sm_targets}", file=sys.stderr)
+        assert len(sm_targets) > 0, "No ROCm architectures found"
+        os.environ["PYTORCH_ROCM_ARCH"] = ";".join(sm_targets)
+    else:
+        sm_targets = get_sm_targets()
+        print(f"Detected SM targets: {sm_targets}", file=sys.stderr)
 
-    assert len(sm_targets) > 0, "No SM targets found"
+        assert len(sm_targets) > 0, "No SM targets found"
 
     GCC_FLAGS = ["-DENABLE_BF16=1", "-DBUILD_NUNCHAKU=1", "-fvisibility=hidden", "-g", "-std=c++20", "-UNDEBUG", "-Og"]
     MSVC_FLAGS = ["/DENABLE_BF16=1", "/DBUILD_NUNCHAKU=1", "/std:c++20", "/UNDEBUG", "/Zc:__cplusplus", "/FS"]
@@ -141,9 +188,32 @@ if __name__ == "__main__":
 
     NVCC_MSVC_FLAGS = ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/FS", "-Xcompiler", "/bigobj"]
 
+    if IS_ROCM:
+        NVCC_FLAGS = [
+            "-DENABLE_BF16=1",
+            "-DBUILD_NUNCHAKU=1",
+            "-std=c++20",
+            "-UNDEBUG",
+            "-O3",
+            "-U__HIP_NO_HALF_OPERATORS__",
+            "-U__HIP_NO_HALF_CONVERSIONS__",
+            # clang rejects fmt's compile-time format string checks in device compilation
+            "-DFMT_CONSTEVAL=",
+            *THIRD_PARTY_FLAGS,
+        ]
+        if os.getenv("NUNCHAKU_ROCM_MMA_REFERENCE", "0") == "1":
+            # build the scalar reference of the matrix-instruction paths, to check those paths bit for bit
+            NVCC_FLAGS.append("-DNUNCHAKU_ROCM_MMA_REFERENCE")
+        GCC_FLAGS += THIRD_PARTY_FLAGS
+        MSVC_FLAGS += THIRD_PARTY_FLAGS
+        # hipcc takes no nvcc -Xcompiler forwarding; the host flags reach the compiler through "cxx".
+        NVCC_MSVC_FLAGS = []
+
     nunchaku_extension = CUDAExtension(
         name="nunchaku._C",
         sources=[
+            src
+            for src in [
             "nunchaku/csrc/pybind.cpp",
             "src/interop/torch.cpp",
             "src/activation.cpp",
@@ -184,6 +254,9 @@ if __name__ == "__main__":
             "src/kernels/awq/gemv_awq.cu",
             *ncond("third_party/Block-Sparse-Attention/csrc/block_sparse_attn/flash_api.cpp"),
             *ncond("third_party/Block-Sparse-Attention/csrc/block_sparse_attn/flash_api_adapter.cpp"),
+            *(["src/interop/flash_api_rocm.cpp"] if IS_ROCM else []),
+            ]
+            if not (IS_ROCM and is_cuda_only_source(src))
         ],
         extra_compile_args={"gcc": GCC_FLAGS, "msvc": MSVC_FLAGS, "nvcc": NVCC_FLAGS, "nvcc_msvc": NVCC_MSVC_FLAGS},
         include_dirs=INCLUDE_DIRS,

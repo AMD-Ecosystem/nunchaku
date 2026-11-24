@@ -1,6 +1,13 @@
 #include "utils.cuh"
 #include "reduction_utils.cuh"
 
+#ifdef USE_ROCM
+// HIP has no __ldg for the half and bfloat16 types.
+#define VLLM_LDG(arg) (*(arg))
+#else
+#define VLLM_LDG(arg) __ldg(arg)
+#endif
+
 namespace vllm {
 
 template<typename T>
@@ -18,8 +25,8 @@ __global__ void silu_and_mul_kernel(scalar_t *__restrict__ out,         // [...,
     const int64_t token_idx_d  = token_idx * int64_t(d);
     const int64_t token_idx_2d = token_idx_d * 2;
     for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
-        const scalar_t x       = __ldg(&input[token_idx_2d + idx]);
-        const scalar_t y       = __ldg(&input[token_idx_2d + d + idx]);
+        const scalar_t x       = VLLM_LDG(&input[token_idx_2d + idx]);
+        const scalar_t y       = VLLM_LDG(&input[token_idx_2d + d + idx]);
         out[token_idx_d + idx] = silu(x) * y;
     }
 }
@@ -40,8 +47,8 @@ __global__ void dequant_silu_and_mul_quant_kernel(int8_t *__restrict__ out,     
         const float zero = 0.0f;
 
         for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
-            const float x            = (float)__ldg(&input[token_idx * 2 * d + idx]) * scale_gate;
-            const float y            = (float)__ldg(&input[token_idx * 2 * d + d + idx]) * scale_up;
+            const float x            = (float)VLLM_LDG(&input[token_idx * 2 * d + idx]) * scale_gate;
+            const float y            = (float)VLLM_LDG(&input[token_idx * 2 * d + d + idx]) * scale_up;
             float t                  = silu(x) * y;
             tmp[token_idx * d + idx] = t;
             t                        = t > zero ? t : -t;
@@ -63,8 +70,8 @@ __global__ void dequant_silu_and_mul_quant_kernel(int8_t *__restrict__ out,     
         }
     } else {
         for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
-            const float x            = (float)__ldg(&input[token_idx * 2 * d + idx]) * scale_gate;
-            const float y            = (float)__ldg(&input[token_idx * 2 * d + d + idx]) * scale_up;
+            const float x            = (float)VLLM_LDG(&input[token_idx * 2 * d + idx]) * scale_gate;
+            const float y            = (float)VLLM_LDG(&input[token_idx * 2 * d + d + idx]) * scale_up;
             out[token_idx * d + idx] = float_to_int8_rn(silu(x) * y / scale_out);
         }
     }
@@ -80,7 +87,11 @@ __global__ void activation_kernel(scalar_t *__restrict__ out,         // [..., d
                                   const int d) {
     const int token_idx = blockIdx.x;
     for (int idx = threadIdx.x; idx < d; idx += blockDim.x) {
-        const scalar_t x         = __ldg(&input[token_idx * d + idx]);
+#ifdef USE_ROCM
+        const scalar_t x = input[token_idx * d + idx];
+#else
+        const scalar_t x = VLLM_LDG(&input[token_idx * d + idx]);
+#endif
         out[token_idx * d + idx] = ACT_FN(x);
     }
 }

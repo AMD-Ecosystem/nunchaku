@@ -96,7 +96,7 @@ public:
             }
             if constexpr (LANES_PER_HEAD < WARP_SIZE) {
                 for (int i = 0; i < PACK_SIZE; i++) {
-                    rms[i] = __shfl_sync(~0, rms[i], laneId % LANES_PER_HEAD);
+                    rms[i] = shfl_warp(rms[i], laneId % LANES_PER_HEAD);
                 }
             }
 
@@ -122,7 +122,7 @@ public:
                                }
                                if constexpr (LANES_PER_HEAD < WARP_SIZE) {
                                    for (int i = 0; i < rope.size(); i++) {
-                                       rope[i] = __shfl_sync(~0, rope[i], laneId % LANES_PER_HEAD);
+                                       rope[i] = shfl_warp(rope[i], laneId % LANES_PER_HEAD);
                                    }
                                }
 
@@ -134,7 +134,7 @@ public:
                                }
 #pragma unroll
                                for (int mask = LANES_PER_HEAD / 2; mask > 0; mask /= 2) {
-                                   sqrsum += __shfl_xor_sync(~0, sqrsum, mask);
+                                   sqrsum += shfl_xor_warp(sqrsum, mask);
                                }
                                sqrsum /= HEAD_DIM;
                                float coef = cuda_frsqrt(sqrsum + epsilon);
@@ -329,7 +329,7 @@ public:
 
             __shared__ half_t shmem_rmsnorm[NUM_WARPS][HEAD_DIM];
             load_rmsnorm(ptr_rmsnorm_weight, &shmem_rmsnorm[warpId][0]);
-            __syncwarp();
+            syncwarp();
 
             rotemb_warp rotemb = load_rotemb(ptr_rotemb);
 
@@ -356,8 +356,8 @@ public:
                     }
 #pragma unroll
                     for (int mask = 1; mask <= 2; mask *= 2) {
-                        sqrsum[0] += __shfl_xor_sync(~0, sqrsum[0], mask);
-                        sqrsum[1] += __shfl_xor_sync(~0, sqrsum[1], mask);
+                        sqrsum[0] += shfl_xor_warp(sqrsum[0], mask);
+                        sqrsum[1] += shfl_xor_warp(sqrsum[1], mask);
                     }
                     rmsnorm_coef[head][m][0] = cuda_frsqrt(sqrsum[0] / HEAD_DIM + epsilon);
                     rmsnorm_coef[head][m][1] = cuda_frsqrt(sqrsum[1] / HEAD_DIM + epsilon);
@@ -594,7 +594,7 @@ public:
                 for (int i = laneId; i < sizeof(shmem_vk) / sizeof(float) / NUM_WARPS; i += WARP_SIZE) {
                     *((&shmem_vk[warpId][0][0]) + i) = 0;
                 }
-                __syncwarp();
+                syncwarp();
 
                 for (int tile_v = 0; tile_v < LITELA_V_TILES; tile_v++) {
                     for (int tile_k = 0; tile_k < LITELA_K_TILES; tile_k++) {
@@ -604,7 +604,7 @@ public:
                             packed_fpsum_t v = fpsum[i * WARP_N_TILES + head_id * (LITELA_HEAD_DIM * 2) / 16 +
                                                      LITELA_HEAD_DIM / 16 + tile_v];
                             for (int j = 0; j < 4; j++) {
-                                k.data[j] = __hmax2(k.data[j], half2_t(0, 0)); // relu
+                                k.data[j] = hmax2(k.data[j], half2_t(0, 0)); // relu
                             }
                             attn_sum = mma_litela(k, v, attn_sum);
                         }
@@ -628,7 +628,7 @@ public:
                         packed_fpsum_t k = fpsum[i * WARP_N_TILES + head_id * (LITELA_HEAD_DIM * 2) / 16 + tile_k];
                         packed_fpsum_t v = {};
                         for (int j = 0; j < 4; j++) {
-                            k.data[j] = __hmax2(k.data[j], half2_t(0, 0)); // relu
+                            k.data[j] = hmax2(k.data[j], half2_t(0, 0)); // relu
                         }
 #pragma unroll
                         for (int i = 0; i < 4; i++) {

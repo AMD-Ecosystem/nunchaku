@@ -26,7 +26,8 @@ void quantize_w8a8_act(Tensor input, Tensor output, Tensor oscales, bool fuse_gl
         auto func =
             invoke_kernel<kernel, const GEMM::half_t *, GEMM::packed_act_t *, GEMM::packed_ascale_t *, int, bool>;
 
-        checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, 92160));
+        checkCUDA(cudaFuncSetAttribute(
+            reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, 92160));
 
         func<<<grid, block, kernel::smemSize(M, K)>>>(input.data_ptr<GEMM::half_t>(),
                                                       output.data_ptr<GEMM::packed_act_t>(),
@@ -160,7 +161,7 @@ void gemm_w8a8_fuse_litela(
         bool,
         bool>;
 
-    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, Epilogue::SHMEM_SIZE));
+    checkCUDA(cudaFuncSetAttribute(reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, Epilogue::SHMEM_SIZE));
 
     dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
 

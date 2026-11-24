@@ -23,6 +23,19 @@
 #include <cublas_v2.h>
 #include <spdlog/spdlog.h>
 
+#ifdef USE_ROCM
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+
+// NVTX ranges compile to nothing on ROCm.
+#define nvtxRangePushA(name) ((void)(name))
+#define nvtxRangePop() ((void)0)
+
+inline const char *cublasGetStatusString(cublasStatus_t status) {
+    return hipblasStatusToString(status);
+}
+#endif
+
 class CUDAError : public std::runtime_error {
 public:
     CUDAError(cudaError_t errorCode, std::source_location location)

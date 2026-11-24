@@ -270,7 +270,7 @@ void cast(Tensor input, Tensor output) {
 
     dispatch(input.scalar_type(), [&]<typename input_t>() {
         dispatch(output.scalar_type(), [&]<typename output_t>() {
-            constexpr int unroll = 16 / std::max(sizeof(input_t), sizeof(output_t));
+            constexpr int unroll = 16 / std::max<size_t>(sizeof(input_t), sizeof(output_t));
 
             int threadsPerBlock = 1024;
             int blocksPerGrid   = (int)ceilDiv<int64_t>(input.numel(), threadsPerBlock * unroll);

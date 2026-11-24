@@ -5,7 +5,9 @@
 #include "kernels/awq/gemv_awq.h"
 #include "kernels/dwconv.h"
 
+#ifndef USE_ROCM
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 using namespace nunchaku;
 

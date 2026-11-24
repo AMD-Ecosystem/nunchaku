@@ -15,14 +15,106 @@
 #include <cuda_bf16.h>
 #endif
 
+#ifdef USE_ROCM
+// Give the printf above a trap a chance to reach the host before the wave is killed.
+__device__ __forceinline__ static void trap_after_sleep() {
+    for (int i = 0; i < 64; i++) {
+        __builtin_amdgcn_s_sleep(127);
+    }
+    __builtin_trap();
+}
+#endif
+
 __device__ __forceinline__ static void trap_unsupported_arch() {
     if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) {
         printf("This kernel is not supported on your GPU\n");
     }
     __syncthreads();
+#ifdef USE_ROCM
+    trap_after_sleep();
+#else
     __nanosleep(1000000);
     __trap();
+#endif
 }
+
+// Shuffles within a 32-lane warp. All kernels here index a 32-lane warp; on AMD GPUs with a 64-lane
+// wavefront, a width of 32 keeps the two warps of a wavefront independent.
+#ifdef USE_ROCM
+// Bit copy between types of equal size; unlike __builtin_bit_cast it accepts the HIP half and bfloat16 types,
+// which are not trivially copyable.
+template<typename To, typename From>
+__device__ __forceinline__ static To bit_copy(const From &from) {
+    static_assert(sizeof(To) == sizeof(From));
+    To to;
+    __builtin_memcpy((void *)&to, (const void *)&from, sizeof(To));
+    return to;
+}
+
+template<typename T, typename F>
+__device__ __forceinline__ static T shfl_bits(T val, F &&shfl) {
+    static_assert(sizeof(T) == 2 || sizeof(T) % 4 == 0);
+    if constexpr (sizeof(T) == 2) {
+        return bit_copy<T>((unsigned short)shfl((int)bit_copy<unsigned short>(val)));
+    } else {
+        struct words {
+            int w[sizeof(T) / 4];
+        };
+        words v = bit_copy<words>(val);
+#pragma unroll
+        for (int i = 0; i < sizeof(T) / 4; i++) {
+            v.w[i] = shfl(v.w[i]);
+        }
+        return bit_copy<T>(v);
+    }
+}
+#endif
+
+template<typename T>
+__device__ __forceinline__ static T shfl_warp(T val, int srcLane) {
+#ifdef USE_ROCM
+    return shfl_bits(val, [srcLane](int v) { return __shfl(v, srcLane, 32); });
+#else
+    return __shfl_sync(~0, val, srcLane);
+#endif
+}
+
+template<typename T>
+__device__ __forceinline__ static T shfl_xor_warp(T val, int laneMask) {
+#ifdef USE_ROCM
+    return shfl_bits(val, [laneMask](int v) { return __shfl_xor(v, laneMask, 32); });
+#else
+    return __shfl_xor_sync(~0, val, laneMask);
+#endif
+}
+
+// HIP has no __hmax2 for half2.
+template<typename T>
+__device__ __forceinline__ static T hmax2(T a, T b) {
+#ifdef USE_ROCM
+    return T(__hmax(a.x, b.x), __hmax(a.y, b.y));
+#else
+    return __hmax2(a, b);
+#endif
+}
+
+__device__ __forceinline__ static void syncwarp() {
+#ifdef USE_ROCM
+    // A 32-lane warp never spans two wavefronts, so its lanes execute in lockstep; this only orders memory.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
+    __syncwarp();
+#endif
+}
+
+#ifdef USE_ROCM
+// cvt.rni.sat.s8: round to nearest even, saturate to [-128, 127], NaN to 0.
+__device__ __forceinline__ static int float_to_int8_sat_rn(float x) {
+    return x != x ? 0 : (int)fminf(fmaxf(rintf(x), -128.0f), 127.0f);
+}
+#endif
 
 #if defined(ENABLE_BF16) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 __device__ __forceinline__ static __nv_bfloat162
@@ -155,9 +247,13 @@ inline __device__ float2 operator-(float2 a, float b) {
 }
 
 static inline __device__ int8_t float_to_int8_rn(float x) {
+#ifdef USE_ROCM
+    return (int8_t)float_to_int8_sat_rn(x);
+#else
     uint32_t dst;
     asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(dst) : "f"(x));
     return reinterpret_cast<const int8_t &>(dst);
+#endif
 }
 
 template<typename T>
@@ -170,7 +266,7 @@ inline __device__ T ldg(const T *val) {
 #define float22bf162 __float22bfloat162_rn
 #define bf162bf162 __bfloat162bfloat162
 inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(USE_ROCM)
     float2 f_val;
     f_val.x = max(min(__low2float(val), 127.f), -128.f);
     f_val.y = max(min(__high2float(val), 127.f), -128.f);
@@ -202,7 +298,7 @@ inline __device__ int16_t bf1622int16(__nv_bfloat162 val) {
 #if ENABLE_BF16
 template<>
 inline __device__ __nv_bfloat162 ldg(const __nv_bfloat162 *val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(USE_ROCM)
     return val[0];
 #else
     return __ldg(val);
@@ -211,7 +307,7 @@ inline __device__ __nv_bfloat162 ldg(const __nv_bfloat162 *val) {
 
 template<>
 inline __device__ __nv_bfloat16 ldg(const __nv_bfloat16 *val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800) || defined(USE_ROCM)
     return val[0];
 #else
     return __ldg(val);
@@ -221,7 +317,16 @@ inline __device__ __nv_bfloat16 ldg(const __nv_bfloat16 *val) {
 
 template<typename T_OUT, typename T_IN>
 __device__ inline T_OUT cuda_cast(T_IN val) {
+#ifdef USE_ROCM
+    // The HIP half and bfloat16 types have several integer constructors, so an implicit conversion is ambiguous.
+    if constexpr (std::is_integral_v<T_IN> && !std::is_integral_v<T_OUT>) {
+        return T_OUT((float)val);
+    } else {
+        return val;
+    }
+#else
     return val;
+#endif
 }
 
 template<>
@@ -267,7 +372,11 @@ __device__ inline int8_t cuda_cast<int8_t, half>(half val) {
     };
 
     fp16 = val;
+#ifdef USE_ROCM
+    int16 = (int8_t)float_to_int8_sat_rn(__half2float(fp16));
+#else
     asm volatile("cvt.rni.sat.s8.f16 %0, %1;" : "=h"(int16) : "h"(int16_in));
+#endif
     return int8[0];
 }
 
@@ -290,7 +399,11 @@ __device__ inline int8_t cuda_cast<int8_t, float>(float val) {
         int16_t int16;
     };
 
+#ifdef USE_ROCM
+    int16 = (int8_t)float_to_int8_sat_rn(val);
+#else
     asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=h"(int16) : "f"(val));
+#endif
     return int8[0];
 }
 
@@ -381,7 +494,11 @@ __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, __nv_bfloat16>(__nv_b
 
 template<>
 __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, float>(float val) {
+#ifdef USE_ROCM
+    return __bfloat162bfloat162(__float2bfloat16(val));
+#else
     return __float2bfloat162_rn(val);
+#endif
 }
 
 template<>
@@ -454,7 +571,7 @@ __device__ inline half cuda_max(half2 val) {
 #ifdef ENABLE_BF16
 template<>
 __device__ inline __nv_bfloat16 cuda_max(__nv_bfloat162 val) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)) || defined(USE_ROCM)
     return __hmax(val.x, val.y);
 #else
     assert(false);

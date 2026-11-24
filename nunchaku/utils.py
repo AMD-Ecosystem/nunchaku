@@ -186,6 +186,32 @@ def filter_state_dict(state_dict: dict[str, torch.Tensor], filter_prefix: str = 
     return {k.removeprefix(filter_prefix): v for k, v in state_dict.items() if k.startswith(filter_prefix)}
 
 
+# AMD GPUs with FP4 matrix instructions; the NVFP4 kernels trap on every other AMD GPU.
+ROCM_FP4_ARCHS = ("gfx950", "gfx1250")
+
+
+def get_rocm_arch(device: str | torch.device = "cuda") -> str | None:
+    """
+    Return the AMD GPU architecture of a device, e.g. ``"gfx942"``, or None on a CUDA build of PyTorch.
+
+    Parameters
+    ----------
+    device : str or torch.device, optional
+        Device to check (default: "cuda").
+
+    Returns
+    -------
+    str or None
+        The ``gfx`` architecture name without feature suffixes, or None if PyTorch is not built for ROCm.
+    """
+    if torch.version.hip is None:
+        return None
+    if isinstance(device, str):
+        device = torch.device(device)
+    device_id = 0 if device.index is None else device.index
+    return torch.cuda.get_device_properties(device_id).gcnArchName.split(":")[0]
+
+
 def get_precision(
     precision: str = "auto",
     device: str | torch.device = "cuda",
@@ -217,9 +243,12 @@ def get_precision(
     if precision == "auto":
         if isinstance(device, str):
             device = torch.device(device)
-        capability = torch.cuda.get_device_capability(0 if device.index is None else device.index)
-        sm = f"{capability[0]}{capability[1]}"
-        precision = "fp4" if sm in ["120", "121"] else "int4"
+        if torch.version.hip is not None:
+            precision = "int4"
+        else:
+            capability = torch.cuda.get_device_capability(0 if device.index is None else device.index)
+            sm = f"{capability[0]}{capability[1]}"
+            precision = "fp4" if sm in ["120", "121"] else "int4"
     if pretrained_model_name_or_path is not None:
         if precision == "int4":
             if "fp4" in str(pretrained_model_name_or_path):
@@ -244,6 +273,8 @@ def is_turing(device: str | torch.device = "cuda") -> bool:
     bool
         True if the current GPU is a Turing GPU, False otherwise.
     """
+    if torch.version.hip is not None:
+        return False
     if isinstance(device, str):
         device = torch.device(device)
     device_id = 0 if device.index is None else device.index
@@ -303,6 +334,14 @@ def check_hardware_compatibility(quantization_config: dict, device: str | torch.
     """
     if isinstance(device, str):
         device = torch.device(device)
+    arch = get_rocm_arch(device)
+    if arch is not None:
+        if quantization_config["weight"]["dtype"] == "fp4_e2m1_all" and arch not in ROCM_FP4_ARCHS:
+            raise ValueError(
+                f'"fp4" quantization needs an AMD GPU with FP4 matrix instructions ({", ".join(ROCM_FP4_ARCHS)}); '
+                f'please use "int4" quantization on {arch}.'
+            )
+        return
     capability = torch.cuda.get_device_capability(0 if device.index is None else device.index)
     sm = f"{capability[0]}{capability[1]}"
     if sm in ["120", "121"]:  # you can only use the fp4 models

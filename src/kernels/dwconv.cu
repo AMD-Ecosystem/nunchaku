@@ -1,6 +1,115 @@
 #include "common.h"
 #include "Tensor.h"
 
+#ifdef USE_ROCM
+
+#include <cuda_runtime.h>
+#include "dispatch_utils.h"
+
+// Depthwise 3x3 convolution, stride 1, padding 1, NHWC; one thread per output element, fp32 accumulation.
+template<typename T>
+__global__ static void dwconv3x3_kernel(const T *input,
+                                        const T *weight,
+                                        const T *bias,
+                                        T *out,
+                                        int N,
+                                        int H,
+                                        int W,
+                                        int C,
+                                        size_t in_s0,
+                                        size_t in_s1,
+                                        size_t in_s2,
+                                        size_t w_s0,
+                                        size_t w_s1,
+                                        size_t w_s2,
+                                        size_t out_s0,
+                                        size_t out_s1,
+                                        size_t out_s2) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)N * H * W * C) {
+        return;
+    }
+    const int c = idx % C;
+    const int q = idx / C % W;
+    const int p = idx / C / W % H;
+    const int n = idx / C / W / H;
+
+    float acc = bias ? (float)bias[c] : 0.0f;
+#pragma unroll
+    for (int r = 0; r < 3; r++) {
+        const int h = p + r - 1;
+        if (h < 0 || h >= H) {
+            continue;
+        }
+#pragma unroll
+        for (int s = 0; s < 3; s++) {
+            const int w = q + s - 1;
+            if (w < 0 || w >= W) {
+                continue;
+            }
+            acc += (float)input[n * in_s0 + h * in_s1 + w * in_s2 + c] * (float)weight[c * w_s0 + r * w_s1 + s * w_s2];
+        }
+    }
+    out[n * out_s0 + p * out_s1 + q * out_s2 + c] = (T)acc;
+}
+
+Tensor dwconv_f16(Tensor input, Tensor weight, Tensor out, Tensor bias) {
+    assert(input.ndims() == 4);
+
+    const int N = input.size(0);
+    const int H = input.size(1);
+    const int W = input.size(2);
+    const int C = input.size(3);
+
+    assert(weight.ndims() == 4);
+    assert(weight.size(0) == C);
+    assert(weight.size(1) == 3 && weight.size(2) == 3);
+    assert(weight.size(3) == 1);
+    assert(input.stride(3) == 1 && weight.stride(3) == 1);
+    assert(!bias.valid() || (bias.ndims() == 1 && bias.shape[0] == C));
+
+    if (!out.valid()) {
+        out = Tensor::allocate({N, H, W, C}, input.dtype(), input.device());
+    }
+    assert(out.ndims() == 4);
+    assert(out.size(0) == N);
+    assert(out.size(1) == H);
+    assert(out.size(2) == W);
+    assert(out.size(3) == C);
+    assert(out.stride(3) == 1);
+
+    const size_t total = (size_t)N * H * W * C;
+    if (total == 0) {
+        return out;
+    }
+
+    dispatchFloat16(weight.dtype(), [&]<typename half_t>() {
+        dwconv3x3_kernel<<<ceilDiv<size_t>(total, 256), 256, 0, getCurrentCUDAStream()>>>(
+            input.data_ptr<half_t>(),
+            weight.data_ptr<half_t>(),
+            bias.valid() ? bias.data_ptr<half_t>() : nullptr,
+            out.data_ptr<half_t>(),
+            N,
+            H,
+            W,
+            C,
+            input.stride(0),
+            input.stride(1),
+            input.stride(2),
+            weight.stride(0),
+            weight.stride(1),
+            weight.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2));
+    });
+    checkCUDA(cudaGetLastError());
+
+    return out;
+}
+
+#else
+
 #include "dispatch_cutlass.h"
 
 #include <cuda_runtime.h>
@@ -339,3 +448,5 @@ Tensor dwconv_f16(Tensor input, Tensor weight, Tensor out, Tensor bias) {
 
     return out;
 }
+
+#endif

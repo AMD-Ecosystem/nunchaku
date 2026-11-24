@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 #pragma once
-#define FINAL_MASK 0xffffffff
+#include "utils.cuh"
 
 namespace vllm {
 
@@ -25,7 +25,7 @@ template<typename T>
 __inline__ __device__ T warpReduceSum(T val) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
+        val += shfl_xor_warp(val, mask);
     return val;
 }
 
@@ -35,7 +35,7 @@ __inline__ __device__ T warpReduceSumV2(T *val) {
     for (int i = 0; i < NUM; i++) {
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
-            val[i] += __shfl_xor_sync(FINAL_MASK, val[i], mask, 32);
+            val[i] += shfl_xor_warp(val[i], mask);
     }
     return (T)(0.0f);
 }
@@ -112,7 +112,7 @@ template<typename T>
 __inline__ __device__ T warpReduceMax(T val) {
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1)
-        val = max(val, __shfl_xor_sync(0xffffffff, val, mask, 32));
+        val = max(val, shfl_xor_warp(val, mask));
     return val;
 }
 /* Calculate the maximum of all elements in a block */

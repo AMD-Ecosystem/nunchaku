@@ -9,6 +9,21 @@ public:
     using psum_warp = std::array<packed_psum_t, WARP_M_TILES * WARP_N_TILES>;
 
     __device__ __forceinline__ static packed_psum_t mma(packed_act_t act, packed_wgt_t wgt, packed_psum_t psum) {
+#ifdef USE_ROCM
+        using mma_helper::s8;
+        const uint4 out1 = mma_m16n8kx_s32common<s8, s8>(
+            act, uint2(wgt.x, wgt.y), uint4(psum.data[0], psum.data[1], psum.data[2], psum.data[3]));
+        const uint4 out2 = mma_m16n8kx_s32common<s8, s8>(
+            act, uint2(wgt.z, wgt.w), uint4(psum.data[4], psum.data[5], psum.data[6], psum.data[7]));
+        psum.data[0] = out1.x;
+        psum.data[1] = out1.y;
+        psum.data[2] = out1.z;
+        psum.data[3] = out1.w;
+        psum.data[4] = out2.x;
+        psum.data[5] = out2.y;
+        psum.data[6] = out2.z;
+        psum.data[7] = out2.w;
+#else
         // packed_psum_t psum;
         asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                      "{%0,  %1,  %2,  %3},"
@@ -44,6 +59,7 @@ public:
                        "r"(psum.data[5]),
                        "r"(psum.data[6]),
                        "r"(psum.data[7]));
+#endif
         return psum;
     }
 
@@ -118,14 +134,14 @@ public:
             }
             mat[row][col] = qpack;
         }
-        __syncwarp();
+        syncwarp();
 
         // convert to imma format
         int row = laneId % 16;
         int col = laneId / 16 * 4;
         ldmatrix(&mat[row][col], output);
 
-        __syncwarp();
+        syncwarp();
     }
 
     /**
@@ -202,7 +218,7 @@ public:
 
 #pragma unroll
         for (int mask = 32 / 2; mask > 0; mask /= 2) {
-            maxvalue2 = __hmax2(maxvalue2, __shfl_xor_sync(~0, maxvalue2, mask));
+            maxvalue2 = __hmax2(maxvalue2, shfl_xor_warp(maxvalue2, mask));
         }
 
         return __hmax(maxvalue2.x, maxvalue2.y);
@@ -328,13 +344,13 @@ public:
                 *reinterpret_cast<half_t *>(&mat[row + 8][col + 4]) = fsum.data[1];
                 *reinterpret_cast<half_t *>(&mat[row + 8][col + 4]) = fsum.data[3];
             }
-            __syncwarp();
+            syncwarp();
 
             for (int row = 0; row < INSN_M; row++) {
                 pack_t pack = *reinterpret_cast<pack_t *>(&mat[row][laneId * PACK_SIZE]);
                 store(reinterpret_cast<pack_t *>(&output[(i * INSN_M + row) * stride + laneId * PACK_SIZE]), pack);
             }
-            __syncwarp();
+            syncwarp();
         }
     }
 

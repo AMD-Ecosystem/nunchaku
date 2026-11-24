@@ -9,7 +9,20 @@
 // #include "../../../nunchaku/csrc/utils.cuh"
 #include "../utils.cuh"
 
+#ifdef USE_ROCM
+#include "../zgemm/mma_rocm.cuh"
+
+using lds_uint16_t = __attribute__((address_space(3))) uint16_t;
+using lds_uint32_t = __attribute__((address_space(3))) uint32_t;
+using uint32x4_t   = unsigned int __attribute__((ext_vector_type(4)));
+using lds_uint4    = __attribute__((address_space(3))) uint32x4_t;
+
+// Shared-memory copies are synchronous here, so there is nothing to commit or wait for.
+__device__ __forceinline__ static void __pipeline_commit() {}
+__device__ __forceinline__ static void __pipeline_wait_prior(int) {}
+#else
 #include <cuda_pipeline_primitives.h>
+#endif
 
 #define kInterleave 4
 #define OP_M 16
@@ -28,10 +41,18 @@
 #define L2_CACHEHINT(size)
 #endif
 
+#ifdef USE_ROCM
+// The split-K semaphores must start at zero; freshly allocated device memory is not zeroed.
+#define ZERO_SEMAPHORES(ptr, n) checkCUDA(cudaMemsetAsync(ptr, 0, (n) * sizeof(int), 0));
+#else
+#define ZERO_SEMAPHORES(ptr, n)
+#endif
+
 #define KERNEL_LAUNCH_CODE                                                                                             \
-    int num_mn_tiles        = (num_in_feats + CTA_M - 1) / CTA_M * (num_out_channels + CTA_N - 1) / CTA_N;             \
-    Tensor _semaphores      = Tensor::empty({num_mn_tiles}, Tensor::INT32, _in_feats.device());                        \
-    auto semaphores         = reinterpret_cast<int *>(_semaphores.data_ptr<int>());                                    \
+    int num_mn_tiles   = (num_in_feats + CTA_M - 1) / CTA_M * (num_out_channels + CTA_N - 1) / CTA_N;                  \
+    Tensor _semaphores = Tensor::empty({num_mn_tiles}, Tensor::INT32, _in_feats.device());                             \
+    auto semaphores    = reinterpret_cast<int *>(_semaphores.data_ptr<int>());                                         \
+    ZERO_SEMAPHORES(semaphores, num_mn_tiles)                                                                          \
     constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N) * (CTA_K / WARP_K);                                  \
     constexpr int SCALES_SMEM_SIZE =                                                                                   \
         (G >= CTA_K) ? (CTA_N / (G / CTA_K) * STAGES * 2) : (CTA_N * (CTA_K / G) * STAGES * 2);                        \
@@ -46,7 +67,8 @@
     dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1 * SPLITK);                                        \
     dim3 threads_per_block(WARP_SIZE, NUM_WARPS);                                                                      \
     auto kernel_func = gemm_w4a16_T1<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G, SPLITK>;           \
-    cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);                     \
+    cudaFuncSetAttribute(                                                                                              \
+        reinterpret_cast<const void *>(kernel_func), cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);      \
     kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(                                                     \
         in_feats, kernel, scales, zeros, out_feats, semaphores, num_in_feats, num_out_channels, num_in_channels);
 
@@ -74,16 +96,24 @@ __device__ void sync_slice(int slice_id) {
         constexpr int SLICE_GROUP      = (SLICES + 7) / 8;
         constexpr uint32_t num_threads = NUM_WARPS_MN * WARP_SIZE;
         const uint32_t barrier_id      = slice_id / SLICE_GROUP + 1;
+#ifdef USE_ROCM
+        __syncthreads();
+#else
         asm volatile("bar.sync %0, %1;" : : "r"(barrier_id), "n"(num_threads));
+#endif
     }
 }
 
 __inline__ __device__ uint32_t cast_smem_ptr_to_uint(void const *const ptr) {
     uint32_t smem_int_ptr;
 
+#ifdef USE_ROCM
+    smem_int_ptr = (uint32_t)(uintptr_t)(const lds_uint32_t *)ptr;
+#else
     asm("{.reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
         : "=r"(smem_int_ptr)
         : "l"(ptr));
+#endif
 
     return smem_int_ptr;
 }
@@ -92,6 +122,16 @@ template<typename f16_t>
 __inline__ __device__ void ldmatrix_m8n8_x4_b16(f16_t *shared_warp, int ax0_0, uint32_t addr) {
     static_assert(std::is_same<f16_t, half>::value || std::is_same<f16_t, __nv_bfloat16>::value,
                   "ldmatrix_m8n8_x4_b16 supports only half or __nv_bfloat16 types.");
+#ifdef USE_ROCM
+    // Lane i supplies the address of row i % 8 of matrix i / 8; each lane receives row lane / 4,
+    // columns 2 * (lane % 4) and 2 * (lane % 4) + 1 of each matrix.
+    const int lane = __lane_id() % 32;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        const uint32_t row                           = shfl_warp(addr, 8 * m + lane / 4);
+        ((unsigned *)(shared_warp + (ax0_0 * 8)))[m] = ((const lds_uint32_t *)(uintptr_t)row)[lane % 4];
+    }
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16"
                  "{%0, %1, %2, %3}, [%4];"
                  : "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[0]),
@@ -99,12 +139,25 @@ __inline__ __device__ void ldmatrix_m8n8_x4_b16(f16_t *shared_warp, int ax0_0, u
                    "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[2]),
                    "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[3])
                  : "r"(addr));
+#endif
 }
 
 template<typename f16_t>
 __inline__ __device__ void ldmatrix_m8n8_x4_trans_b16(f16_t *shared_warp, int ax0_0, uint32_t addr) {
     static_assert(std::is_same<f16_t, half>::value || std::is_same<f16_t, __nv_bfloat16>::value,
                   "ldmatrix_m8n8_x4_trans_b16 supports only half or __nv_bfloat16 types.");
+#ifdef USE_ROCM
+    // As above, but each matrix is transposed: lane i receives rows 2 * (i % 4) and 2 * (i % 4) + 1 of column i / 4.
+    const int lane = __lane_id() % 32;
+#pragma unroll
+    for (int m = 0; m < 4; m++) {
+        const uint32_t row0                          = shfl_warp(addr, 8 * m + 2 * (lane % 4));
+        const uint32_t row1                          = shfl_warp(addr, 8 * m + 2 * (lane % 4) + 1);
+        const uint32_t lo                            = ((const lds_uint16_t *)(uintptr_t)row0)[lane / 4];
+        const uint32_t hi                            = ((const lds_uint16_t *)(uintptr_t)row1)[lane / 4];
+        ((unsigned *)(shared_warp + (ax0_0 * 8)))[m] = lo | (hi << 16);
+    }
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"
                  "{%0, %1, %2, %3}, [%4];"
                  : "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[0]),
@@ -112,9 +165,16 @@ __inline__ __device__ void ldmatrix_m8n8_x4_trans_b16(f16_t *shared_warp, int ax
                    "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[2]),
                    "=r"(((unsigned *)(shared_warp + (ax0_0 * 8)))[3])
                  : "r"(addr));
+#endif
 }
 
 __inline__ __device__ void cp_async_cg_A(uint32_t smem_int_ptr, const uint4 *__restrict__ src, bool mask) {
+#ifdef USE_ROCM
+    if (mask) {
+        const uint4 v                         = *src;
+        *(lds_uint4 *)(uintptr_t)smem_int_ptr = {v.x, v.y, v.z, v.w};
+    }
+#else
     const int cp_size = 16;
     asm volatile("{"
                  "  .reg .pred p;"
@@ -124,11 +184,30 @@ __inline__ __device__ void cp_async_cg_A(uint32_t smem_int_ptr, const uint4 *__r
                  "r"(smem_int_ptr),
                  "l"(src),
                  "n"(cp_size));
+#endif
 }
 
 template<typename f16_t>
 __device__ __inline__ void mma_m16n8k16(float *C_warp, f16_t *A_shared_warp, f16_t *B_shared_warp);
 
+#ifdef USE_ROCM
+template<typename f16_t>
+__device__ __inline__ void mma_m16n8k16(float *C_warp, f16_t *A_shared_warp, f16_t *B_shared_warp) {
+    const unsigned *a = (const unsigned *)A_shared_warp;
+    const unsigned *b = (const unsigned *)B_shared_warp;
+    const uint4 d     = nunchaku::kernels::mma_m16n8k16_f32f16f16f32<std::is_same_v<f16_t, __nv_bfloat16>>(
+        uint4(a[0], a[1], a[2], a[3]),
+        uint2(b[0], b[1]),
+        uint4(__float_as_uint(C_warp[0]),
+              __float_as_uint(C_warp[1]),
+              __float_as_uint(C_warp[2]),
+              __float_as_uint(C_warp[3])));
+    C_warp[0] = __uint_as_float(d.x);
+    C_warp[1] = __uint_as_float(d.y);
+    C_warp[2] = __uint_as_float(d.z);
+    C_warp[3] = __uint_as_float(d.w);
+}
+#else
 template<>
 __device__ __inline__ void mma_m16n8k16<half>(float *C_warp, half *A_shared_warp, half *B_shared_warp) {
     asm volatile(
@@ -165,6 +244,7 @@ mma_m16n8k16<__nv_bfloat16>(float *C_warp, __nv_bfloat16 *A_shared_warp, __nv_bf
           "f"(((float *)C_warp)[2]),
           "f"(((float *)C_warp)[3]));
 }
+#endif
 
 template<typename f16_t, int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
 __device__ __inline__ void global_to_share_one_stage_A(f16_t *src,
@@ -1242,7 +1322,11 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             constexpr int WARP_N = 32;
             constexpr int WARP_K = 64;
             constexpr int SPLITK = 1;
+#ifdef USE_ROCM
+            constexpr int STAGES = 3; // four stages need 72 KB of shared memory, above the 64 KB of most AMD GPUs
+#else
             constexpr int STAGES = 4;
+#endif
             KERNEL_LAUNCH_CODE
         } else if (num_out_feats <= 192) {
             constexpr int G      = 128;
@@ -1277,7 +1361,9 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1);
             dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
             auto kernel_func = gemm_w4a16_T2<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
+            cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel_func),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kSmemByteSize);
             kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(
                 in_feats, kernel, scales, zeros, out_feats, num_in_feats, num_out_channels, num_in_channels);
         }
@@ -1322,7 +1408,11 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             constexpr int WARP_N = 32;
             constexpr int WARP_K = 64;
             constexpr int SPLITK = 1;
+#ifdef USE_ROCM
+            constexpr int STAGES = 3; // four stages need 72 KB of shared memory, above the 64 KB of most AMD GPUs
+#else
             constexpr int STAGES = 4;
+#endif
             KERNEL_LAUNCH_CODE
         } else if (num_out_feats <= 192) {
             constexpr int G      = 128;
@@ -1357,7 +1447,9 @@ Tensor awq_gemm_forward_cuda(Tensor _in_feats, Tensor _kernel, Tensor _scales, T
             dim3 num_blocks((num_out_feats + CTA_M - 1) / CTA_M * j_factors1);
             dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
             auto kernel_func = gemm_w4a16_T2<f16_t, CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
-            cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize);
+            cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel_func),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kSmemByteSize);
             kernel_func<<<num_blocks, threads_per_block, kSmemByteSize>>>(
                 in_feats, kernel, scales, zeros, out_feats, num_in_feats, num_out_channels, num_in_channels);
         }

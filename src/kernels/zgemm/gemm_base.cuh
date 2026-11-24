@@ -5,7 +5,11 @@
 #include "../utils.cuh"
 #include "../dispatch_utils.h"
 #include "gemm_utils.cuh"
+#ifdef USE_ROCM
+#include "mma_rocm.cuh"
+#else
 #include "mma_earlycuda.cuh"
+#endif
 
 #pragma nv_diag_suppress 177
 
@@ -129,7 +133,7 @@ public:
      * */
     static constexpr int WSCALES_PACK_SIZE   = clamp(WARP_N / WARP_SIZE, 4 / sizeof(half), 16 / sizeof(half));
     static constexpr int WSCALES_NUM_PACKS   = ceilDiv(WARP_N, (WSCALES_PACK_SIZE * WARP_SIZE));
-    static constexpr int WSCALES_VALID_LANES = std::min(WARP_SIZE, WARP_N / WSCALES_PACK_SIZE);
+    static constexpr int WSCALES_VALID_LANES = std::min<int>(WARP_SIZE, WARP_N / WSCALES_PACK_SIZE);
 
     /**
      * ascales store order: (pack = 2)
@@ -151,7 +155,7 @@ public:
      */
     static constexpr int ASCALES_PACK_SIZE   = clamp(WARP_M / WARP_SIZE, 4 / sizeof(half), 16 / sizeof(half));
     static constexpr int ASCALES_NUM_PACKS   = ceilDiv(WARP_M, (ASCALES_PACK_SIZE * WARP_SIZE));
-    static constexpr int ASCALES_VALID_LANES = std::min(WARP_SIZE, WARP_M / ASCALES_PACK_SIZE);
+    static constexpr int ASCALES_VALID_LANES = std::min<int>(WARP_SIZE, WARP_M / ASCALES_PACK_SIZE);
 
     using packed_act_t = uint4;
     using packed_wgt_t = uint4;
@@ -344,14 +348,14 @@ public:
         const int packIdx    = k / (WSCALES_PACK_SIZE * WARP_SIZE);
         const int srcLane    = 4 * (k / WSCALES_PACK_SIZE) + laneId % 4;
         const int elementIdx = k % WSCALES_PACK_SIZE / 2;
-        return __shfl_sync(~0, block[packIdx].data[elementIdx], srcLane);
+        return shfl_warp(block[packIdx].data[elementIdx], srcLane);
     }
     // get {k}-th and {k+1}-th ascale from the block, k must be multiples of 2, k must be uniform across all lanes
     __device__ __forceinline__ static half2_t broadcast_ascale(ascale_warp block, int k, int laneId) {
         const int packIdx    = k / (ASCALES_PACK_SIZE * WARP_SIZE);
         const int srcLane    = 8 * (k / ASCALES_PACK_SIZE) + laneId / 4;
         const int elementIdx = k % ASCALES_PACK_SIZE / 2;
-        return __shfl_sync(~0, block[packIdx].data[elementIdx], srcLane);
+        return shfl_warp(block[packIdx].data[elementIdx], srcLane);
     }
 
     struct i2f_normal {
@@ -529,7 +533,7 @@ public:
                     *reinterpret_cast<half2_t *>(&mat[row][col + 0]) = fsum.data[0];
                     *reinterpret_cast<half2_t *>(&mat[row][col + 8]) = fsum.data[2];
                 }
-                __syncwarp();
+                syncwarp();
 
 #pragma unroll
                 for (int row = 0; row < 8; row++) {
@@ -548,7 +552,7 @@ public:
                                pred);
                     // }
                 }
-                __syncwarp();
+                syncwarp();
 
 #pragma unroll
                 for (int j = 0; j < WARP_N_TILES; j++) {
@@ -558,7 +562,7 @@ public:
                     *reinterpret_cast<half2_t *>(&mat[row][col + 0]) = fsum.data[1];
                     *reinterpret_cast<half2_t *>(&mat[row][col + 8]) = fsum.data[3];
                 }
-                __syncwarp();
+                syncwarp();
 
 #pragma unroll
                 for (int row = 0; row < 8; row++) {
@@ -578,7 +582,7 @@ public:
                         pred);
                     // }
                 }
-                __syncwarp();
+                syncwarp();
             }
             // if (enableReduce) {
             //     store<true>(reinterpret_cast<pack_t *>(&reduce_result[laneId * PACK_SIZE]), reduce_tmp);
@@ -631,7 +635,7 @@ public:
                     }
                     store<true>(reinterpret_cast<packed_input *>(&mat[row][laneId * PACK_SIZE]), pack);
                 }
-                __syncwarp();
+                syncwarp();
 
                 for (int n = 0; n < WARP_N_TILES; n++) {
                     const int row = laneId % 16;
@@ -640,7 +644,7 @@ public:
                     ldmatrix(&mat[row][col], tmp);
                     *reinterpret_cast<uint4 *>(&out[m * WARP_N_TILES + n]) = tmp;
                 }
-                __syncwarp();
+                syncwarp();
             }
         }
     };
@@ -892,6 +896,13 @@ template<typename kernel, typename... T>
 __global__ static void invoke_kernel(T... args) {
 #ifdef __CUDA_ARCH__
     if constexpr (__CUDA_ARCH__ >= min_arch<kernel>() && __CUDA_ARCH__ <= max_arch<kernel>()) {
+        kernel()(args...);
+    } else {
+        trap_unsupported_arch();
+    }
+#elif defined(USE_ROCM)
+    // AMD GPUs run every kernel written for sm_80 and later; kernels limited to older GPUs trap.
+    if constexpr (max_arch<kernel>() >= 800) {
         kernel()(args...);
     } else {
         trap_unsupported_arch();

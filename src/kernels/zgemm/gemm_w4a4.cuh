@@ -36,8 +36,12 @@ public:
             printf("FP4 is not available on this device\n");
         }
         __syncthreads();
+#ifdef USE_ROCM
+        trap_after_sleep();
+#else
         __nanosleep(1000000);
         __trap();
+#endif
     }
 
     static_assert(WARP_N % 32 == 0);
@@ -121,8 +125,8 @@ public:
         for (int mask = 2; mask > 0; mask /= 2) {
 #pragma unroll
             for (int i = 0; i < NUM_GROUPS; i++) {
-                maxvalue[0][i] = __hmax(maxvalue[0][i], __shfl_xor_sync(~0, maxvalue[0][i], mask));
-                maxvalue[1][i] = __hmax(maxvalue[1][i], __shfl_xor_sync(~0, maxvalue[1][i], mask));
+                maxvalue[0][i] = __hmax(maxvalue[0][i], shfl_xor_warp(maxvalue[0][i], mask));
+                maxvalue[1][i] = __hmax(maxvalue[1][i], shfl_xor_warp(maxvalue[1][i], mask));
             }
         }
         // lane 0,1,2,3 / 4,5,6,7 / ...  should have identical maxvalue now
@@ -170,7 +174,7 @@ public:
             for (int i = 0; i < INSN_K / INSN_M * 2; i++) {
 #pragma unroll
                 for (int j = 0; j < 2; j++) {
-                    qpacks[j][i] |= __shfl_xor_sync(~0, qpacks[j][i], mask);
+                    qpacks[j][i] |= shfl_xor_warp(qpacks[j][i], mask);
                 }
             }
         }
@@ -196,6 +200,9 @@ public:
                                                                int ida,
                                                                int idb) {
         packed_f32psum_t out;
+#ifdef USE_ROCM
+        trap_no_fp4();
+#else
         asm volatile(
             "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
             "{%0, %1, %2, %3}, "
@@ -246,6 +253,7 @@ public:
               "r"(wmscale),
               "n"(0),
               "h"((short)(idb * 2 + 1)));
+#endif
         return out;
     }
 
@@ -464,11 +472,11 @@ public:
         }
 #pragma unroll
         for (int mask = 2; mask > 0; mask /= 2) {
-            maxvalue[0] = __hmax(maxvalue[0], __shfl_xor_sync(~0, maxvalue[0], mask));
-            maxvalue[1] = __hmax(maxvalue[1], __shfl_xor_sync(~0, maxvalue[1], mask));
+            maxvalue[0] = __hmax(maxvalue[0], shfl_xor_warp(maxvalue[0], mask));
+            maxvalue[1] = __hmax(maxvalue[1], shfl_xor_warp(maxvalue[1], mask));
         }
-        maxvalue[0] = __shfl_sync(~0, maxvalue[0], laneId / 4 * 4);
-        maxvalue[1] = __shfl_sync(~0, maxvalue[1], laneId / 4 * 4);
+        maxvalue[0] = shfl_warp(maxvalue[0], laneId / 4 * 4);
+        maxvalue[1] = shfl_warp(maxvalue[1], laneId / 4 * 4);
 
         float scale[2];
         // scale[0] = float(maxvalue[0]) / QVALUE_MAX;
@@ -505,7 +513,7 @@ public:
             for (int i = 0; i < INSN_K / INSN_M * 2; i++) {
 #pragma unroll
                 for (int j = 0; j < 2; j++) {
-                    qpacks[j][i] |= __shfl_xor_sync(~0, qpacks[j][i], mask);
+                    qpacks[j][i] |= shfl_xor_warp(qpacks[j][i], mask);
                 }
             }
         }
@@ -576,14 +584,14 @@ public:
         for (int mask = NUM_PACKS_PER_ROW / 2; mask > 0; mask /= 2) {
 #pragma unroll
             for (int i = 0; i < NUM_PACKWARPS; i++) {
-                maxvalue[i] = __hmax(maxvalue[i], __shfl_xor_sync(~0, maxvalue[i], mask));
+                maxvalue[i] = __hmax(maxvalue[i], shfl_xor_warp(maxvalue[i], mask));
             }
         }
 
         // broadcast (max)
 #pragma unroll
         for (int i = 0; i < NUM_PACKWARPS; i++) {
-            maxvalue[i] = __shfl_sync(~0, maxvalue[i], laneId / NUM_PACKS_PER_ROW * NUM_PACKS_PER_ROW);
+            maxvalue[i] = shfl_warp(maxvalue[i], laneId / NUM_PACKS_PER_ROW * NUM_PACKS_PER_ROW);
         }
 
         // quantize
@@ -611,14 +619,14 @@ public:
             }
             mat[i * NUM_ROWS_PER_PACKWARP + laneId / NUM_PACKS_PER_ROW][laneId % NUM_PACKS_PER_ROW] = qpack;
         }
-        __syncwarp();
+        syncwarp();
 
         // convert to imma format
         int row = laneId % 16;
         int col = laneId / 16 * 4;
         ldmatrix(&mat[row][col], output);
 
-        __syncwarp();
+        syncwarp();
     }
 
     // each thread block (1 warp) quantize WARP_M * WARP_K tile (32 * 64)
@@ -841,6 +849,14 @@ public:
                                                            int K,
                                                            const Epilogue::Arguments &epilogueArgs,
                                                            bool alwaysfalse) {
+#ifdef NUNCHAKU_ROCM_MFMA_INT4
+        if constexpr (!USE_FP32_ACCUM) {
+            gemm_w4a4_block_mfma<Epilogue, ACT_UNSIGNED>(
+                binfo, act, wgt, ascales, wscales, M, N, K, epilogueArgs, alwaysfalse);
+            return;
+        }
+#endif
+
         constexpr int NUM_STAGES = 2;
 
         const int laneId = threadIdx.x % WARP_SIZE;
@@ -925,6 +941,215 @@ public:
         CHECK_NAN(f16psum, "f16psum");
 
         Epilogue()(binfo, f16psum, M, N, K, epilogueArgs);
+    }
+
+#ifdef USE_ROCM
+    // Dynamic shared memory the matrix-instruction main loops below use before the epilogue runs; the launcher
+    // allocates at least this much on ROCm.
+    static constexpr int ROCM_MAIN_LOOP_SHMEM_SIZE = 4 * 32 * (32 + 4) * sizeof(int);
+#endif
+
+#ifdef NUNCHAKU_ROCM_MFMA_INT4
+    // The main loop of gemm_w4a4_block on CDNA matrix instructions. Every warp of a block multiplies its own
+    // activation rows by the same weight tile, so one 32x32 i8 MFMA per wavefront takes the 16 rows of an
+    // activation tile from each of its two 32-lane warps and the 32 columns of two weight tiles. Operands are
+    // loaded from global memory directly in the MFMA layout, 4-bit values widened to 8 bits in registers. Each
+    // 32x32 result goes through shared memory into the per-lane layout of the mma.sync accumulators, and the
+    // scales are applied exactly as in apply_scales, so the result equals the reference path bit for bit.
+    template<typename Epilogue, bool ACT_UNSIGNED>
+    __device__ __forceinline__ static void gemm_w4a4_block_mfma(const BlockInfo binfo,
+                                                                const packed_act_t *act,
+                                                                const packed_wgt_t *wgt,
+                                                                const packed_ascale_t *ascales,
+                                                                const packed_wscale_t *wscales,
+                                                                int M,
+                                                                int N,
+                                                                int K,
+                                                                const Epilogue::Arguments &epilogueArgs,
+                                                                bool alwaysfalse) {
+        static_assert(WARP_SIZE == 32 && WARP_M_TILES == 2 && WARP_N_TILES % 2 == 0 && INSN_K == 64);
+        constexpr int NUM_STAGES  = 2;
+        constexpr int NUM_WAVES   = NUM_WARPS / 2;
+        constexpr int NUM_K_STEPS = INSN_K / 16; // k elements per MFMA: 16 (two 8-element chunks)
+#if defined(__gfx90a__)
+        constexpr int NUM_CHUNK_STEPS = 8; // v_mfma_i32_32x32x8i8: half a chunk (4 bytes) per lane
+#else
+        constexpr int NUM_CHUNK_STEPS = NUM_K_STEPS;
+#endif
+
+        const int laneId = threadIdx.x % WARP_SIZE;
+        const int lane64 = threadIdx.x % 64;
+        const int waveId = threadIdx.x / 64;
+        const int col    = lane64 % 32; // MFMA column (activation row) and row (weight column) of this lane
+        const int hw     = lane64 / 32; // which 32-lane warp of the wavefront
+
+        // chunk c of a 16x64 fragment holds k = 8c .. 8c+7; register (x, y, z, w) of lane 4 * (r % 8) + c % 4
+        auto chunk_of = [&](int step) {
+#if defined(__gfx90a__)
+            return step;
+#else
+            return 2 * step + hw;
+#endif
+        };
+        auto act_word = [&](int step) {
+            const int rr = col % 16, c = chunk_of(step);
+            const int warp = 2 * waveId + col / 16;
+            const int reg  = (c < 4 ? 0 : 2) + (rr < 8 ? 0 : 1);
+            return (warp * WARP_M_TILES * WARP_SIZE + 4 * (rr % 8) + c % 4) * 4 + reg;
+        };
+        auto wgt_word = [&](int step) {
+            const int nn = col % 16, c = chunk_of(step);
+            const int tile = col / 16;
+            const int reg  = (nn < 8 ? 0 : 2) + (c < 4 ? 0 : 1);
+            return (tile * WARP_SIZE + 4 * (nn % 8) + c % 4) * 4 + reg;
+        };
+
+        int act_off[NUM_CHUNK_STEPS], wgt_off[NUM_CHUNK_STEPS];
+#pragma unroll
+        for (int s = 0; s < NUM_CHUNK_STEPS; s++) {
+            act_off[s] = act_word(s);
+            wgt_off[s] = wgt_word(s);
+        }
+
+        const uint32_t *act_words  = reinterpret_cast<const uint32_t *>(act);
+        const uint32_t *wgt_words  = reinterpret_cast<const uint32_t *>(wgt);
+        constexpr int ACT_K_STRIDE = NUM_WARPS * WARP_M_TILES * WARP_SIZE * 4; // words per k step
+        constexpr int WGT_K_STRIDE = WARP_N_TILES * WARP_SIZE * 4;
+
+        uint32_t A[NUM_STAGES][WARP_M_TILES][NUM_CHUNK_STEPS];
+        uint32_t W[NUM_STAGES][WARP_N_TILES / 2][NUM_CHUNK_STEPS];
+        ascale_warp ascale[NUM_STAGES];
+        wscale_warp wscale[NUM_STAGES];
+        fpsum_warp fpsum;
+
+        auto load = [&](int k, int stage, bool pred) {
+#pragma unroll
+            for (int s = 0; s < NUM_CHUNK_STEPS; s++) {
+#pragma unroll
+                for (int i = 0; i < WARP_M_TILES; i++) {
+                    A[stage][i][s] = load_pred(&act_words[k * ACT_K_STRIDE + i * WARP_SIZE * 4 + act_off[s]], pred);
+                }
+#pragma unroll
+                for (int jj = 0; jj < WARP_N_TILES / 2; jj++) {
+                    W[stage][jj][s] =
+                        load_pred(&wgt_words[k * WGT_K_STRIDE + jj * 2 * WARP_SIZE * 4 + wgt_off[s]], pred);
+                }
+            }
+            load_ascale(ascales, k, M, ascale[stage], pred);
+            load_wscale(wscales, k, N, wscale[stage], pred);
+        };
+
+        // one 32x32 int32 result per wavefront: [activation row][weight column], padded against bank conflicts
+        using result_t = int[NUM_WAVES][32][32 + 4];
+        static_assert(sizeof(result_t) <= ROCM_MAIN_LOOP_SHMEM_SIZE);
+        extern __shared__ uint8_t shmem[];
+        auto &result = (*reinterpret_cast<result_t *>(shmem))[waveId];
+
+        for (int k = 0; k < NUM_STAGES - 1; k++) {
+            load(k, k, true);
+        }
+
+#pragma unroll
+        for (auto &pack : fpsum) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                pack.data[i].x = 0;
+                pack.data[i].y = 0;
+            }
+        }
+
+        int dummy = 0;
+
+        for (int k1 = 0; k1 < K / WARP_K; k1 += NUM_STAGES) {
+#pragma unroll
+            for (int k2 = 0; k2 < NUM_STAGES; k2++) {
+                const int nextk = k1 + k2 + NUM_STAGES - 1;
+                load(nextk, (k2 + NUM_STAGES - 1) % NUM_STAGES, nextk < K / WARP_K);
+
+                half2_t asx[WARP_M_TILES];
+                half2_t asy[WARP_M_TILES];
+#pragma unroll
+                for (int i = 0; i < WARP_M_TILES; i++) {
+                    half2_t as = broadcast_ascale(ascale[k2], i * 2, laneId);
+                    asx[i]     = half2_t(as.x, as.x);
+                    asy[i]     = half2_t(as.y, as.y);
+                }
+
+#pragma unroll
+                for (int jj = 0; jj < WARP_N_TILES / 2; jj++) {
+#pragma unroll
+                    for (int i = 0; i < WARP_M_TILES; i++) {
+                        int __attribute__((ext_vector_type(16))) acc = {};
+#pragma unroll
+                        for (int s = 0; s < NUM_CHUNK_STEPS; s++) {
+                            const uint64_t a = mma_rocm::widen_int4x8<false>(W[k2][jj][s]);
+                            const uint64_t b = mma_rocm::widen_int4x8<ACT_UNSIGNED>(A[k2][i][s]);
+#if defined(__gfx90a__)
+                            acc = __builtin_amdgcn_mfma_i32_32x32x8i8(
+                                (int)(hw ? a >> 32 : a), (int)(hw ? b >> 32 : b), acc, 0, 0, 0);
+#else
+                            acc = __builtin_amdgcn_mfma_i32_32x32x16_i8((long)a, (long)b, acc, 0, 0, 0);
+#endif
+                        }
+
+                        // lane (col, hw) holds weight columns 8q + 4 * hw .. + 3 of activation row col
+#pragma unroll
+                        for (int q = 0; q < 4; q++) {
+                            *reinterpret_cast<int4 *>(&result[col][8 * q + 4 * hw]) =
+                                make_int4(acc[4 * q], acc[4 * q + 1], acc[4 * q + 2], acc[4 * q + 3]);
+                        }
+                        syncwarp();
+
+                        // the mma.sync accumulator layout of tiles (i, 2 * jj) and (i, 2 * jj + 1)
+                        const int row = 16 * hw + laneId / 4;
+                        const int c0  = 2 * (laneId % 4);
+                        packed_psum_t psum[2];
+#pragma unroll
+                        for (int p = 0; p < 2; p++) {
+                            const int2 v0 = *reinterpret_cast<const int2 *>(&result[row][16 * p + c0]);
+                            const int2 v1 = *reinterpret_cast<const int2 *>(&result[row + 8][16 * p + c0]);
+                            const int2 v2 = *reinterpret_cast<const int2 *>(&result[row][16 * p + 8 + c0]);
+                            const int2 v3 = *reinterpret_cast<const int2 *>(&result[row + 8][16 * p + 8 + c0]);
+                            psum[p]       = {v0.x, v0.y, v1.x, v1.y, v2.x, v2.y, v3.x, v3.y};
+                        }
+                        syncwarp();
+
+#pragma unroll
+                        for (int p = 0; p < 2; p++) {
+                            const int j       = 2 * jj + p;
+                            const half2_t ws1 = broadcast_wscale(wscale[k2], j * 4, laneId);
+                            const half2_t ws2 = broadcast_wscale(wscale[k2], j * 4 + 2, laneId);
+                            apply_scales_tile(psum[p], asx[i], asy[i], ws1, ws2, fpsum[i * WARP_N_TILES + j]);
+                        }
+                    }
+                }
+
+                if (alwaysfalse) {
+                    dummy = clock();
+                }
+            }
+        }
+
+        unused_var(dummy, alwaysfalse);
+
+        CHECK_NAN(fpsum, "fpsum");
+
+        // the epilogue may use the dynamic shared memory that held the results
+        __syncthreads();
+
+        Epilogue()(binfo, fpsum, M, N, K, epilogueArgs);
+    }
+#endif
+
+    // The scale arithmetic of apply_scales for one 16x16 tile, given its integer partial sums in the mma.sync
+    // accumulator layout.
+    __device__ __forceinline__ static void apply_scales_tile(
+        const packed_psum_t &psum, half2_t asx, half2_t asy, half2_t ws1, half2_t ws2, packed_fpsum_t &fsum) {
+        using i2f    = typename Base::i2f_normal;
+        fsum.data[0] = __hfma2(i2f::int2half2(psum.data[0], psum.data[1]), __hmul2(asx, ws1), fsum.data[0]);
+        fsum.data[1] = __hfma2(i2f::int2half2(psum.data[2], psum.data[3]), __hmul2(asy, ws1), fsum.data[1]);
+        fsum.data[2] = __hfma2(i2f::int2half2(psum.data[4], psum.data[5]), __hmul2(asx, ws2), fsum.data[2]);
+        fsum.data[3] = __hfma2(i2f::int2half2(psum.data[6], psum.data[7]), __hmul2(asy, ws2), fsum.data[3]);
     }
 
     template<bool FUSE_GELU, bool USE_UNSIGNED, bool USE_FP4>
@@ -1012,10 +1237,10 @@ public:
                     }
                 }
                 if constexpr (!USE_FP4) {
-                    __syncwarp();
+                    syncwarp();
                     pack_ascales(&oscale_shmem[warpId][0],
                                  &oscales[(group * NUM_WARPS + warpId) * ASCALES_NUM_PACKS * ASCALES_VALID_LANES]);
-                    __syncwarp();
+                    syncwarp();
                 }
             }
         }

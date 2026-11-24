@@ -60,7 +60,7 @@ public:
     using typename AttentionConfig::epilogue_half_t;
     using typename AttentionConfig::epilogue_half2_t;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800) || defined(USE_ROCM)
     static constexpr bool IS_SM80 = true;
 #else
     static constexpr bool IS_SM80 = false;
@@ -198,7 +198,7 @@ public:
          * but not the other,
          * the result is the non-NaN parameter.
          */
-        return __hmax2(input, half2_t(neginf, neginf));
+        return hmax2(input, half2_t(neginf, neginf));
     }
 
     __device__ __forceinline__ static float fix_nan(float input) {
@@ -278,8 +278,8 @@ public:
             }
 #pragma unroll
             for (int mask = 1; mask <= 2; mask *= 2) {
-                maxv.x = fmaxf(maxv.x, __shfl_xor_sync(~0, maxv.x, mask));
-                maxv.y = fmaxf(maxv.y, __shfl_xor_sync(~0, maxv.y, mask));
+                maxv.x = fmaxf(maxv.x, shfl_xor_warp(maxv.x, mask));
+                maxv.y = fmaxf(maxv.y, shfl_xor_warp(maxv.y, mask));
             }
             rowmax[m].x = fmaxf(rowmax[m].x, maxv.x * scale);
             rowmax[m].y = fmaxf(rowmax[m].y, maxv.y * scale);
@@ -320,8 +320,8 @@ public:
             }
 #pragma unroll
             for (int mask = 1; mask <= 2; mask *= 2) {
-                sumv.x += __shfl_xor_sync(~0, sumv.x, mask);
-                sumv.y += __shfl_xor_sync(~0, sumv.y, mask);
+                sumv.x += shfl_xor_warp(sumv.x, mask);
+                sumv.y += shfl_xor_warp(sumv.y, mask);
             }
             rowsum[m] = sumv;
         }
@@ -576,7 +576,7 @@ public:
         for (int i = 0; i < SHMEM_TILES; i++) {
             store<true>(&Q_shmem[warpId][i][laneId], Q[Q.size() - 1 - i]);
         }
-        __syncwarp();
+        syncwarp();
 
         int dummy = 0;
 

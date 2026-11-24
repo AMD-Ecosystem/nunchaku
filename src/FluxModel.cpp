@@ -2,9 +2,15 @@
 #include "kernels/misc_kernels.h"
 #include "kernels/gemm_batched.h"
 #include "kernels/zgemm/zgemm.h"
+#ifdef USE_ROCM
+#include "interop/flash_api_rocm.h"
+#else
 #include "flash_api.h"
+#endif
 #include "activation.h"
+#ifndef USE_ROCM
 #include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <pybind11/functional.h>
 

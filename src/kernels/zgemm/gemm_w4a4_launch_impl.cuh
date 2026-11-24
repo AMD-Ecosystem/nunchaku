@@ -68,6 +68,9 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
     }
 
     int shmem = 0;
+#ifdef USE_ROCM
+    shmem = GEMM::ROCM_MAIN_LOOP_SHMEM_SIZE;
+#endif
 
     auto launch = [&]<typename Epilogue>(Epilogue::Arguments args) {
         assert(M % GEMM::BLOCK_M == 0);
@@ -101,7 +104,8 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
                                           bool>;
 
                 if (shmem >= 24 * 1024) {
-                    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+                    checkCUDA(cudaFuncSetAttribute(
+                        reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
                 }
 
                 assert(alpha == 1.0f);
@@ -140,7 +144,8 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
                                           bool>;
 
                 if (shmem >= 24 * 1024) {
-                    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+                    checkCUDA(cudaFuncSetAttribute(
+                        reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
                 }
 
                 assert(ascales.dtype() == Tensor::FP8_E4M3);
@@ -495,7 +500,8 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
 
         auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
-        checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
+        checkCUDA(cudaFuncSetAttribute(
+            reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
 
         // log(std::format("quantize_w4a4_act_fuse_lora M={} N={} input={} output={} (size={} numel={})", M, N,
         // input.data_ptr(), output.data_ptr(), output.buffer->getSize(), output.numel()));

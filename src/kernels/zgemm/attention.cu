@@ -71,7 +71,8 @@ void attention_fp16(Tensor q, // packed [Batch, Head, TokensQ, HEAD_DIM]
             shmem = std::max(shmem, Attention::template attention_fp16_kernel<Epilogue>::SHMEM_SIZE);
 
             if (shmem >= 24 * 1024) {
-                checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+                checkCUDA(cudaFuncSetAttribute(
+                    reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
             }
 
             func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, shmem, getCurrentCUDAStream()>>>(q.data_ptr<packed_q_t>(),

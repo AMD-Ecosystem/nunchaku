@@ -55,7 +55,9 @@ public:
     /// Permit fetching the synchronization mechanism early
     __device__ void fetch() {
         if (wait_thread) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(USE_ROCM)
+            state = __hip_atomic_load(lock, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
 #else
             asm volatile("ld.global.cg.b32 %0, [%1];\n" : "=r"(state) : "l"(lock));
@@ -82,7 +84,9 @@ public:
         __syncthreads();
 
         if (wait_thread) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(USE_ROCM)
+            __hip_atomic_store(lock, status, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             asm volatile("st.global.release.gpu.b32 [%0], %1;\n" : : "l"(lock), "r"(status));
 #else
             asm volatile("st.global.cg.b32 [%0], %1;\n" : : "l"(lock), "r"(status));

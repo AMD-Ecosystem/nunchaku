@@ -21,7 +21,8 @@ void test_rmsnorm_rope(Tensor input, Tensor output, Tensor norm_q, Tensor norm_k
 
     auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
-    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
+    checkCUDA(cudaFuncSetAttribute(
+        reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
 
     dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
 
@@ -59,7 +60,8 @@ void test_pack_qkv(Tensor input, Tensor out_q, Tensor out_k, Tensor out_v, int n
 
     auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
-    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
+    checkCUDA(cudaFuncSetAttribute(
+        reinterpret_cast<const void *>(func), cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
 
     dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
 
