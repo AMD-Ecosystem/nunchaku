@@ -175,3 +175,23 @@ This command installs Nunchaku in editable mode along with all development depen
 .. important::
 
    Set ``NUNCHAKU_INSTALL_MODE=ALL`` to ensure the wheel works on all supported GPU architectures. Otherwise, it may only run on the GPU type used for building.
+
+Building for AMD GPUs (ROCm)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Nunchaku also builds as a HIP extension for AMD GPUs with a ROCm build of PyTorch (2.7 or newer).
+The INT4 kernels use the matrix instructions of CDNA GPUs (MFMA: ``gfx90a``, ``gfx942``, ``gfx950``) and RDNA GPUs (WMMA: ``gfx11``, ``gfx12``).
+Only INT4 models run on AMD GPUs; NVFP4 models are not supported there.
+Block-sparse attention is not available on ROCm, and the ``flashattn2`` attention option runs through PyTorch's ``scaled_dot_product_attention``.
+
+.. code-block:: shell
+
+    # Install a ROCm build of PyTorch, e.g. from https://pytorch.org/get-started/locally/
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+
+    git clone --recurse-submodules https://github.com/nunchux-ai/nunchaku.git
+    cd nunchaku
+    PYTORCH_ROCM_ARCH=gfx942 pip install -e "." --no-build-isolation
+
+``PYTORCH_ROCM_ARCH`` selects the GPU architectures to compile for (separate several with ``;``).
+Without it, the build targets the AMD GPUs in the machine, or a fixed list of CDNA and RDNA architectures with ``NUNCHAKU_INSTALL_MODE=ALL``.
