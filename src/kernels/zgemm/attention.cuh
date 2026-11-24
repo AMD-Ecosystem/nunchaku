@@ -184,9 +184,14 @@ public:
 
     __device__ __forceinline__ static packed_fpsum_t
     mma_f16xf16_f16(packed_fpsum_t a, packed_fpsum_t b, packed_fpsum_t psum) {
+#ifdef USE_ROCM
+        const uint4 out = mma_m16n16k16_f16f16f16f16(a, b, psum);
+        return packed_fpsum_t{out.x, out.y, out.z, out.w};
+#else
         uint2 out1 = mma_m16n8k16_f16f16f16f16(a, uint2(b.x, b.y), uint2(psum.x, psum.y));
         uint2 out2 = mma_m16n8k16_f16f16f16f16(a, uint2(b.z, b.w), uint2(psum.z, psum.w));
         return packed_fpsum_t{out1.x, out1.y, out2.x, out2.y};
+#endif
     }
 
     // set nan values to -inf

@@ -191,21 +191,27 @@ template<typename f16_t>
 __device__ __inline__ void mma_m16n8k16(float *C_warp, f16_t *A_shared_warp, f16_t *B_shared_warp);
 
 #ifdef USE_ROCM
+// The two m16n8k16 products with the same A fragment of the main loop, as one m16n16k16.
 template<typename f16_t>
-__device__ __inline__ void mma_m16n8k16(float *C_warp, f16_t *A_shared_warp, f16_t *B_shared_warp) {
-    const unsigned *a = (const unsigned *)A_shared_warp;
-    const unsigned *b = (const unsigned *)B_shared_warp;
-    const uint4 d     = nunchaku::kernels::mma_m16n8k16_f32f16f16f32<std::is_same_v<f16_t, __nv_bfloat16>>(
-        uint4(a[0], a[1], a[2], a[3]),
-        uint2(b[0], b[1]),
-        uint4(__float_as_uint(C_warp[0]),
-              __float_as_uint(C_warp[1]),
-              __float_as_uint(C_warp[2]),
-              __float_as_uint(C_warp[3])));
-    C_warp[0] = __uint_as_float(d.x);
-    C_warp[1] = __uint_as_float(d.y);
-    C_warp[2] = __uint_as_float(d.z);
-    C_warp[3] = __uint_as_float(d.w);
+__device__ __inline__ void
+mma_m16n16k16(float *C_warp, f16_t *A_shared_warp, f16_t *B_shared_warp_lo, f16_t *B_shared_warp_hi) {
+    const unsigned *a  = (const unsigned *)A_shared_warp;
+    const unsigned *b0 = (const unsigned *)B_shared_warp_lo;
+    const unsigned *b1 = (const unsigned *)B_shared_warp_hi;
+    uint4 c0           = uint4(
+        __float_as_uint(C_warp[0]), __float_as_uint(C_warp[1]), __float_as_uint(C_warp[2]), __float_as_uint(C_warp[3]));
+    uint4 c1 = uint4(
+        __float_as_uint(C_warp[4]), __float_as_uint(C_warp[5]), __float_as_uint(C_warp[6]), __float_as_uint(C_warp[7]));
+    nunchaku::kernels::mma_m16n16k16_f32f16f16f32<std::is_same_v<f16_t, __nv_bfloat16>>(
+        uint4(a[0], a[1], a[2], a[3]), uint4(b0[0], b0[1], b1[0], b1[1]), c0, c1);
+    C_warp[0] = __uint_as_float(c0.x);
+    C_warp[1] = __uint_as_float(c0.y);
+    C_warp[2] = __uint_as_float(c0.z);
+    C_warp[3] = __uint_as_float(c0.w);
+    C_warp[4] = __uint_as_float(c1.x);
+    C_warp[5] = __uint_as_float(c1.y);
+    C_warp[6] = __uint_as_float(c1.z);
+    C_warp[7] = __uint_as_float(c1.w);
 }
 #else
 template<>
@@ -649,12 +655,19 @@ __global__ void gemm_w4a16_T1(f16_t *__restrict__ A,
 
             for (int i_0_3 = 0; i_0_3 < WARP_M / INTRIN_M; ++i_0_3) {
                 for (int j_0_4 = 0; j_0_4 < WARP_N / INTRIN_N; ++j_0_4) {
+#ifdef USE_ROCM
+                    mma_m16n16k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8,
+                                  A_shared_warp + i_0_3 * 8,
+                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4,
+                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4 + 8);
+#else
                     mma_m16n8k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8,
                                  A_shared_warp + i_0_3 * 8,
                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4);
                     mma_m16n8k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8 + 4,
                                  A_shared_warp + i_0_3 * 8,
                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4 + 8);
+#endif
                 }
             }
 
@@ -1178,12 +1191,19 @@ __global__ void gemm_w4a16_T2(f16_t *__restrict__ A,
             f16_t *B_shared_warp = B_shared_warp_[(iter_k / 2) % 2];
             for (int i_0_3 = 0; i_0_3 < WARP_M / INTRIN_M; ++i_0_3) {
                 for (int j_0_4 = 0; j_0_4 < WARP_N / INTRIN_N; ++j_0_4) {
+#ifdef USE_ROCM
+                    mma_m16n16k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8,
+                                  A_shared_warp + i_0_3 * 8,
+                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4,
+                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4 + 8);
+#else
                     mma_m16n8k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8,
                                  A_shared_warp + i_0_3 * 8,
                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4);
                     mma_m16n8k16(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8 + 4,
                                  A_shared_warp + i_0_3 * 8,
                                  B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4 + 8);
+#endif
                 }
             }
 
