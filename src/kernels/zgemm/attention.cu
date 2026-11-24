@@ -58,7 +58,7 @@ void attention_fp16(Tensor q, // packed [Batch, Head, TokensQ, HEAD_DIM]
             using packed_k_t = typename Attention::packed_k_t;
             using packed_v_t = typename Attention::packed_v_t;
 
-            auto func = invoke_kernel<typename Attention::attention_fp16_kernel<Epilogue>,
+            auto func = invoke_kernel<typename Attention::template attention_fp16_kernel<Epilogue>,
                                       const packed_q_t *,
                                       const packed_k_t *,
                                       const packed_v_t *,

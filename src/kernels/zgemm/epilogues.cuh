@@ -797,12 +797,12 @@ public:
 
             fpsum_warp fpsum;
 
-            Base::template load_act_to_fpsum<false>()(args.input + m_offset * args.actualN + n_offset,
-                                                      args.actualN,
-                                                      args.actualM - m_offset,
-                                                      args.actualN - n_offset,
-                                                      fpsum,
-                                                      shmem + warpId * SHMEM_PER_WARP);
+            typename Base::template load_act_to_fpsum<false>()(args.input + m_offset * args.actualN + n_offset,
+                                                               args.actualN,
+                                                               args.actualM - m_offset,
+                                                               args.actualN - n_offset,
+                                                               fpsum,
+                                                               shmem + warpId * SHMEM_PER_WARP);
 
             Epilogue()(binfo, fpsum, args.M, args.N, 0, args.argsEpilogue);
 

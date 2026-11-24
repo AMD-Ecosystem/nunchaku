@@ -17,7 +17,7 @@ void test_rmsnorm_rope(Tensor input, Tensor output, Tensor norm_q, Tensor norm_k
     assert(M % GEMM::BLOCK_M == 0);
     assert(N % GEMM::BLOCK_N == 0);
 
-    using kernel = typename GEMM::test_epilogue_kernel<Epilogue>;
+    using kernel = typename GEMM::template test_epilogue_kernel<Epilogue>;
 
     auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
@@ -55,7 +55,7 @@ void test_pack_qkv(Tensor input, Tensor out_q, Tensor out_k, Tensor out_v, int n
     assert(M % GEMM::BLOCK_M == 0);
     assert(N % GEMM::BLOCK_N == 0);
 
-    using kernel = typename GEMM::test_epilogue_kernel<Epilogue>;
+    using kernel = typename GEMM::template test_epilogue_kernel<Epilogue>;
 
     auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 

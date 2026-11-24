@@ -856,7 +856,7 @@ public:
     using typename Base::EpilogueDefault;                                                                              \
     using typename Base::EpilogueNop;                                                                                  \
     template<bool USE_BIAS, bool USE_SCALE>                                                                            \
-    using EpilogueBias = typename Base::EpilogueBias<USE_BIAS, USE_SCALE>;                                             \
+    using EpilogueBias = typename Base::template EpilogueBias<USE_BIAS, USE_SCALE>;                                    \
     using Base::mma_f16xf16_f32;                                                                                       \
     using Base::packed_fp32_to_fp16;                                                                                   \
     using Base::packed_fp16_to_fp32;                                                                                   \

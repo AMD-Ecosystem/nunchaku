@@ -1140,13 +1140,14 @@ public:
 
             fpsum_warp fpsum;
 
-            Base::template load_act_to_fpsum<fuse_glu>()(args.input + m_offset * args.actualN + n_offset,
-                                                         args.actualN,
-                                                         args.actualM - m_offset,
-                                                         args.actualN - n_offset,
-                                                         fpsum,
-                                                         shmem + warpId * SHMEM_PER_WARP
-                                                         // args.smooth_factor ? args.smooth_factor + n_offset : nullptr
+            typename Base::template load_act_to_fpsum<fuse_glu>()(
+                args.input + m_offset * args.actualN + n_offset,
+                args.actualN,
+                args.actualM - m_offset,
+                args.actualN - n_offset,
+                fpsum,
+                shmem + warpId * SHMEM_PER_WARP
+                // args.smooth_factor ? args.smooth_factor + n_offset : nullptr
             );
 
             CHECK_NAN(fpsum, "fpsum");

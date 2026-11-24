@@ -88,7 +88,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
         if constexpr (!USE_FP4) {
             dispatchBool(act_unsigned, [&]<bool ACT_UNSIGNED>() {
-                auto func = invoke_kernel<typename GEMM::gemm_w4a4_kernel<Epilogue, ACT_UNSIGNED>,
+                auto func = invoke_kernel<typename GEMM::template gemm_w4a4_kernel<Epilogue, ACT_UNSIGNED>,
                                           const packed_act_t *,
                                           const packed_wgt_t *,
                                           const packed_ascale_t *,
@@ -126,7 +126,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
             dispatchBool(alpha != 1.0f, [&]<bool USE_ALPHA>() {
                 assert(!act_unsigned);
 
-                auto func = invoke_kernel<typename GEMM::gemm_w4a4_fp4_kernel<Epilogue, USE_ALPHA>,
+                auto func = invoke_kernel<typename GEMM::template gemm_w4a4_fp4_kernel<Epilogue, USE_ALPHA>,
                                           const packed_act_t *,
                                           const packed_wgt_t *,
                                           const packed_amscale_t *,
@@ -175,12 +175,12 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
         dispatchBool(bias.valid(), [&]<bool USE_BIAS>() {
             dispatchBool(wcscales.valid(), [&]<bool USE_SCALE>() {
-                using EpilogueBias = typename GEMM::EpilogueBias<USE_BIAS, USE_SCALE>;
+                using EpilogueBias = typename GEMM::template EpilogueBias<USE_BIAS, USE_SCALE>;
                 // append EpilgoueNop to workaround mismatched memory layout of std::tuple between device and host code
                 // on Windows
                 // ** sizeof(std::tuple<std::tuple<int>>) == 8 on device **
                 using Epilogue =
-                    typename GEMM::EpilogueCombination<EpilogueBias, NextEpilogue, typename GEMM::EpilogueNop>;
+                    typename GEMM::template EpilogueCombination<EpilogueBias, NextEpilogue, typename GEMM::EpilogueNop>;
                 return launch.template operator()<Epilogue>(
                     {typename EpilogueBias::Arguments{
                          .bias  = USE_BIAS ? bias.data_ptr<packed_wscale_t>() : nullptr,
@@ -203,8 +203,8 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
         if (rank_up == 0) {
             assert(rank_down == 0);
-            return launch_bias.template operator()<typename GEMM::EpilogueCombination<MidEpilogue, NextEpilogue>>(
-                {midArgs, nextArgs});
+            return launch_bias.template
+            operator()<typename GEMM::template EpilogueCombination<MidEpilogue, NextEpilogue>>({midArgs, nextArgs});
         }
 
         assert(rank_up % 16 == 0);
@@ -225,10 +225,10 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         }
 
         if (rank_down == 0) {
-            using Epilogue = typename GEMM::EpilogueCombination<typename LoraUp::EpilogueLoraUp,
-                                                                MidEpilogue,
-                                                                NextEpilogue,
-                                                                typename GEMM::EpilogueNop>;
+            using Epilogue = typename GEMM::template EpilogueCombination<typename LoraUp::EpilogueLoraUp,
+                                                                         MidEpilogue,
+                                                                         NextEpilogue,
+                                                                         typename GEMM::EpilogueNop>;
             return launch_bias.template operator()<Epilogue>({typename LoraUp::EpilogueLoraUp::Arguments{
                                                                   .lora_act    = lora_act_in.data_ptr<float>(),
                                                                   .lora_wgt_up = lora_up.data_ptr<packed_fpsum_t>(),
@@ -254,11 +254,11 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         // dispatchVal(rank_down, std::integer_sequence<int, 16, 32, 48, 64, 80>(), [&]<int RANK_DOWN>() {
 
         using LoraDown = LoraUp; // GEMM::Lora<RANK_DOWN>;
-        using Epilogue = typename GEMM::EpilogueCombination<typename LoraUp::EpilogueLoraUp,
-                                                            MidEpilogue,
-                                                            typename LoraDown::EpilogueLoraDown,
-                                                            NextEpilogue,
-                                                            typename GEMM::EpilogueNop>;
+        using Epilogue = typename GEMM::template EpilogueCombination<typename LoraUp::EpilogueLoraUp,
+                                                                     MidEpilogue,
+                                                                     typename LoraDown::EpilogueLoraDown,
+                                                                     NextEpilogue,
+                                                                     typename GEMM::EpilogueNop>;
         return launch_bias.template operator()<Epilogue>({typename LoraUp::EpilogueLoraUp::Arguments{
                                                               .lora_act    = lora_act_in.data_ptr<float>(),
                                                               .lora_wgt_up = lora_up.data_ptr<packed_fpsum_t>(),
@@ -286,7 +286,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         static constexpr float SHIFT_GELU = 0.171875f;
 
         constexpr bool USE_UNSIGNED = !USE_FP4;
-        using EpilogueQuantize      = typename GEMM::EpilogueQuantize<false, USE_UNSIGNED, USE_FP4>;
+        using EpilogueQuantize      = typename GEMM::template EpilogueQuantize<false, USE_UNSIGNED, USE_FP4>;
         auto argsQuantize =
             typename EpilogueQuantize::Arguments{.qout    = qout.data_ptr<packed_act_t>(),
                                                  .oscales = oscales.data_ptr<typename EpilogueQuantize::oscales_t>(),
@@ -296,7 +296,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
         // TODO: check if gelu is needed
         if (out.valid()) {
             launch_lora.template
-            operator()<typename GEMM::EpilogueCombination<typename GEMM::EpilogueDefault, EpilogueQuantize>,
+            operator()<typename GEMM::template EpilogueCombination<typename GEMM::EpilogueDefault, EpilogueQuantize>,
                        typename Epilogues::EpilogueGelu>({typename GEMM::EpilogueDefault::Arguments{
                                                               .out     = out.data_ptr<half_t>(),
                                                               .actualM = actualM,
@@ -376,7 +376,7 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
 
         if (out_q.valid()) {
             launch_lora.template
-            operator()<typename GEMM::EpilogueCombination<EpilogueRope, typename Epilogues::EpiloguePackQKV>,
+            operator()<typename GEMM::template EpilogueCombination<EpilogueRope, typename Epilogues::EpiloguePackQKV>,
                        typename GEMM::EpilogueNop>(
                 {argsRope,
                  typename Epilogues::EpiloguePackQKV::Arguments{
@@ -393,15 +393,15 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16, false>::gemm_w4a4(
                  }},
                 {});
         } else {
-            launch_lora
-                .template operator()<typename GEMM::EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
-                                     typename GEMM::EpilogueNop>({argsRope,
-                                                                  typename GEMM::EpilogueDefault::Arguments{
-                                                                      .out     = out.data_ptr<half_t>(),
-                                                                      .actualM = actualM,
-                                                                      .actualN = actualN,
-                                                                  }},
-                                                                 {});
+            launch_lora.template
+            operator()<typename GEMM::template EpilogueCombination<EpilogueRope, typename GEMM::EpilogueDefault>,
+                       typename GEMM::EpilogueNop>({argsRope,
+                                                    typename GEMM::EpilogueDefault::Arguments{
+                                                        .out     = out.data_ptr<half_t>(),
+                                                        .actualM = actualM,
+                                                        .actualN = actualN,
+                                                    }},
+                                                   {});
         }
 
     } else if (out.valid()) {
@@ -490,8 +490,8 @@ void GEMM_W4A4_Launch<Config, USE_FP4>::quantize_w4a4_act_fuse_lora(Tensor input
 
     // dispatchVal(rank, LoraRanks(), [&]<int RANK>() {
     dispatchBool(fuse_glu, [&]<bool FUSE_GLU>() {
-        // using Lora = typename GEMM::Lora<RANK>;
-        using kernel = typename GEMM::quantize_w4a4_fuse_lora_kernel<FUSE_GLU, USE_FP4>;
+        // using Lora = typename GEMM::template Lora<RANK>;
+        using kernel = typename GEMM::template quantize_w4a4_fuse_lora_kernel<FUSE_GLU, USE_FP4>;
 
         auto func = invoke_kernel<kernel, typename kernel::Arguments>;
 
