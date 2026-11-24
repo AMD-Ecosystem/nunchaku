@@ -125,9 +125,13 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #endif
 
 // NVFP4 GEMM on the AMD GPUs with FP4 matrix instructions; every other AMD GPU traps on FP4, as NVIDIA GPUs before
-// sm_120 do. The FP4 values are decoded with their block scales into the 16-bit products (gemm_w4a4.cuh).
-#if defined(__gfx950__)
+// sm_120 do. gfx1250 multiplies NVFP4 directly with its block-16 scaled WMMA; on gfx950, and in reference builds,
+// the FP4 values are decoded with their block scales into the 16-bit products (gemm_w4a4.cuh).
+#if defined(__gfx950__) || defined(__gfx1250__)
 #define NUNCHAKU_ROCM_FP4 1
+#endif
+#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && defined(__gfx1250__)
+#define NUNCHAKU_ROCM_WMMA_FP4 1
 #endif
 
 // The 16-bit floating-point products (mma_m16n16k16_* below) on CDNA matrix instructions.
@@ -136,13 +140,13 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #endif
 
 // The same on RDNA GPUs (32-lane wavefronts) with WMMA, which also computes the 16-bit floating-point products
-// (mma_m16n16k16_* below).
-#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__))
+// (mma_m16n16k16_* below). gfx1250 has none of the 16x16x16 WMMA forms used here and takes the reference path.
+#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__)) && !defined(__gfx1250__)
 #define NUNCHAKU_ROCM_WMMA_INT4 1
 #define NUNCHAKU_ROCM_WMMA_F16 1
 #endif
 
-#if defined(NUNCHAKU_ROCM_MFMA_F16) || defined(NUNCHAKU_ROCM_WMMA_F16)
+#if defined(NUNCHAKU_ROCM_MFMA_F16) || defined(NUNCHAKU_ROCM_WMMA_F16) || defined(NUNCHAKU_ROCM_WMMA_FP4)
 namespace mma_rocm {
 template<typename T>
 __device__ __forceinline__ static T select4(T v0, T v1, T v2, T v3, int i) {
@@ -151,24 +155,16 @@ __device__ __forceinline__ static T select4(T v0, T v1, T v2, T v3, int i) {
 } // namespace mma_rocm
 #endif
 
-#ifdef NUNCHAKU_ROCM_MFMA_F16
+#if defined(NUNCHAKU_ROCM_MFMA_F16) || defined(NUNCHAKU_ROCM_WMMA_FP4)
 namespace mma_rocm {
-
-// A 16x16x16 product per 32-lane warp on a 64-lane wavefront, with the four-block 16x16x4 MFMA: block b reads
-// its A and B operands only from lanes 16b .. 16b + 15, so blocks 0 and 1 belong to the lower warp and blocks 2
-// and 3 to the upper one, and no product mixes the two warps. Each block multiplies four values of K; a warp's
-// two blocks take different K and their results are added. The results of all four blocks are spread over the
-// whole wavefront, so moving them back to the fragment layout reads lanes of both warps. All 64 lanes of the
-// wavefront must execute these functions together.
-
-// Moves a 16x16 matrix of 16-bit values from mma.sync fragment registers into the MFMA operand layout. p0, p1,
-// p2, p3 hold (index < 8, k < 8), (index >= 8, k < 8), (index < 8, k >= 8), (index >= 8, k >= 8), where index is
-// the row of A or the column of B and lane 4 * (index % 8) + t holds k 2t and 2t + 1 (+ 8). On return lane l
-// holds index l % 16 with k 8 * (l / 16) .. + 7 as four words in k order. Lane l takes its four words from one
-// source lane each, in a different step starting at word x, so that each source lane is read for one register
-// per step.
+// Moves a 16-row matrix from mma.sync fragment registers into the operand layout of the AMD matrix instructions.
+// p0, p1, p2, p3 hold (index < 8, half 0), (index >= 8, half 0), (index < 8, half 1), (index >= 8, half 1), where
+// index is the row of A or the column of B, the halves are the low and high halves of K, and lane
+// 4 * (index % 8) + t holds word t of its half. On return lane l holds the four words of half l / 16 of index
+// l % 16 in order. Lane l takes its four words from one source lane each, in a different step starting at word x,
+// so that each source lane is read for one register per step.
 __device__ __forceinline__ static void
-mfma_operand_words(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t (&out)[4]) {
+operand_words(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t (&out)[4]) {
     const int lane = __lane_id() % 32;
     const int x    = (lane % 16) / 8 + 2 * (lane / 16); // the register this lane takes from its sources
     const int t    = lane % 4;
@@ -182,6 +178,18 @@ mfma_operand_words(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t 
         out[j] = select4(v[0], v[1], v[2], v[3], (j - x) & 3);
     }
 }
+} // namespace mma_rocm
+#endif
+
+#ifdef NUNCHAKU_ROCM_MFMA_F16
+namespace mma_rocm {
+
+// A 16x16x16 product per 32-lane warp on a 64-lane wavefront, with the four-block 16x16x4 MFMA: block b reads
+// its A and B operands only from lanes 16b .. 16b + 15, so blocks 0 and 1 belong to the lower warp and blocks 2
+// and 3 to the upper one, and no product mixes the two warps. Each block multiplies four values of K; a warp's
+// two blocks take different K and their results are added. The results of all four blocks are spread over the
+// whole wavefront, so moving them back to the fragment layout reads lanes of both warps. All 64 lanes of the
+// wavefront must execute these functions together.
 
 using mfma_acc_t = float __attribute__((ext_vector_type(16)));
 
@@ -206,11 +214,12 @@ __device__ __forceinline__ static mfma_acc_t mfma_16x16x16(const uint32_t (&wa)[
 
 // The operands of the product of an m16n8k16 A fragment a and the B fragments of columns 0-7 and 8-15, {b.x, b.y}
 // and {b.z, b.w}, in the MFMA layout.
+// For 16-bit values each word holds two values of K, so lane l gets k 8 * (l / 16) .. + 7.
 __device__ __forceinline__ static void mfma_operands_a(uint4 a, uint32_t (&wa)[4]) {
-    mfma_operand_words(a.x, a.y, a.z, a.w, wa);
+    operand_words(a.x, a.y, a.z, a.w, wa);
 }
 __device__ __forceinline__ static void mfma_operands_b(uint4 b, uint32_t (&wb)[4]) {
-    mfma_operand_words(b.x, b.z, b.y, b.w, wb);
+    operand_words(b.x, b.z, b.y, b.w, wb);
 }
 
 // Moves the m16n16 product in acc back to the accumulator fragments of columns 0-7 (d0) and 8-15 (d1).

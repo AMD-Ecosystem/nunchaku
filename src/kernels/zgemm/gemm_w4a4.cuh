@@ -386,6 +386,104 @@ public:
 #endif
         }
     }
+
+#ifdef NUNCHAKU_ROCM_WMMA_FP4
+    // gfx1250 multiplies NVFP4 directly with v_wmma_scale16_f32_16x16x128_f8f6f4: e2m1 operands with one e4m3 scale
+    // per 16 values of K for each row of A and B. One instruction takes 128 values of K, the two k steps of both
+    // pipeline stages, so the main loop calls this once per pair of stages. Operand lane l holds row (column)
+    // l % 16 with K 32 * (l / 16) .. + 31 in words 0-3 and 64 + 32 * (l / 16) .. + 31 in words 4-7, eight values
+    // per word; the 64-bit scale operand of lanes 0-15 holds the eight block scales of row l % 16 in K order; result
+    // register v of lane l is row 8 * (l / 16) + v, column l % 16.
+    __device__ __forceinline__ static void compute_fp4_wmma(const act_warp (&A)[2],
+                                                            const wgt_warp (&W)[2],
+                                                            const amscale_warp (&amscale)[2],
+                                                            const wmscale_warp (&wmscale)[2],
+                                                            f32psum_warp &psum) {
+        using operand_t = int __attribute__((ext_vector_type(16)));
+        using acc_t     = float __attribute__((ext_vector_type(8)));
+        constexpr int FMT_FP4        = 4;
+        constexpr int SCALE_FMT_E4M3 = 2;
+
+        const int laneId = threadIdx.x % WARP_SIZE;
+        const int idx    = laneId % 16; // row of A, column of B
+
+        // the scale word of row (column) idx in the mma.sync layout: lane 4 * (idx % 8) + 2 * id + idx / 8
+        auto scales = [&](uint32_t step0, uint32_t step1, int id) {
+            const int src = idx % 8 * 4 + 2 * id + idx / 8;
+            return (int64_t)((uint64_t)shfl_warp(step1, src) << 32 | shfl_warp(step0, src));
+        };
+        auto operand = [](uint4 step0, uint4 step1) {
+            operand_t v = {};
+            uint32_t w[4];
+            mma_rocm::operand_words(step0.x, step0.y, step0.z, step0.w, w);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                v[j] = w[j];
+            }
+            mma_rocm::operand_words(step1.x, step1.y, step1.z, step1.w, w);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                v[4 + j] = w[j];
+            }
+            return v;
+        };
+
+        operand_t a[WARP_M_TILES];
+        int64_t sa[WARP_M_TILES];
+#pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++) {
+            a[i]  = operand(A[0][i], A[1][i]);
+            sa[i] = scales(amscale[0][i / 2 / AMSCALES_PACK_SIZE].data[i / 2 % AMSCALES_PACK_SIZE],
+                           amscale[1][i / 2 / AMSCALES_PACK_SIZE].data[i / 2 % AMSCALES_PACK_SIZE],
+                           i % 2);
+        }
+#pragma unroll
+        for (int j = 0; j < WARP_N_TILES; j++) {
+            // the weight registers are (column, k half): {x, y} for columns 0-7 and {z, w} for columns 8-15
+            const operand_t b = operand(uint4(W[0][j].x, W[0][j].z, W[0][j].y, W[0][j].w),
+                                        uint4(W[1][j].x, W[1][j].z, W[1][j].y, W[1][j].w));
+            const int64_t sb  = scales(wmscale[0][j / 2 / WMSCALES_PACK_SIZE].data[j / 2 % WMSCALES_PACK_SIZE],
+                                      wmscale[1][j / 2 / WMSCALES_PACK_SIZE].data[j / 2 % WMSCALES_PACK_SIZE],
+                                      j % 2);
+#pragma unroll
+            for (int i = 0; i < WARP_M_TILES; i++) {
+                const acc_t d = __builtin_amdgcn_wmma_scale16_f32_16x16x128_f8f6f4(
+                    FMT_FP4, a[i], FMT_FP4, b, 0, acc_t{}, 0, SCALE_FMT_E4M3, sa[i], 0, SCALE_FMT_E4M3, sb, false, false);
+
+                // Lane 4g + t needs rows g, g + 8 and columns 2t, 2t + 1, 2t + 8, 2t + 9: register g of the eight
+                // lanes 16u + column (sources s = 4u + c, c = 0..3 for the four columns). In step q it reads source
+                // (q + g) % 8, which is read in that step only by the lane with g = (s - q) % 8.
+                const int g   = laneId / 4;
+                const int t   = laneId % 4;
+                const int s_s = 4 * (laneId / 16) + idx % 2 + 2 * (idx / 8); // this lane's index as a source
+                float v[8];
+#pragma unroll
+                for (int q = 0; q < 8; q++) {
+                    const int src = (q + g) & 7;
+                    const int r   = (s_s - q) & 7;
+                    const float x = (r & 4) ? mma_rocm::select4(d[4], d[5], d[6], d[7], r & 3)
+                                            : mma_rocm::select4(d[0], d[1], d[2], d[3], r & 3);
+                    v[q] = shfl_warp(x, 16 * (src / 4) + 2 * t + (src & 1) + 8 * ((src >> 1) & 1));
+                }
+                auto from = [&](int src) {
+                    const int q = (src - g) & 7;
+                    return (q & 4) ? mma_rocm::select4(v[4], v[5], v[6], v[7], q & 3)
+                                   : mma_rocm::select4(v[0], v[1], v[2], v[3], q & 3);
+                };
+                // fragment register order: (row g, column 2t), (g, 2t + 1), (g + 8, 2t), (g + 8, 2t + 1)
+                auto &out = psum[i * WARP_N_TILES + j];
+                out.data[0] += from(0);
+                out.data[1] += from(1);
+                out.data[2] += from(4);
+                out.data[3] += from(5);
+                out.data[4] += from(2);
+                out.data[5] += from(3);
+                out.data[6] += from(6);
+                out.data[7] += from(7);
+            }
+        }
+    }
+#endif
 #else
     __device__ __forceinline__ static void
     compute_fp4(act_warp A, wgt_warp W, amscale_warp amscale, wmscale_warp wmscale, f32psum_warp &psum) {
@@ -465,7 +563,14 @@ public:
                 //     dummy = clock();
                 // }
 
+#ifdef NUNCHAKU_ROCM_WMMA_FP4
+                // both stages hold the two k steps of one instruction once the first stage's load is issued
+                if (k2 == 0) {
+                    compute_fp4_wmma(A, W, amscale, wmscale, fpsum);
+                }
+#else
                 compute_fp4(A[k2], W[k2], amscale[k2], wmscale[k2], fpsum);
+#endif
 
                 if (alwaysfalse) {
                     dummy = clock();
