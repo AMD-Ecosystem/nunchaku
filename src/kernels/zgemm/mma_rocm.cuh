@@ -124,6 +124,11 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #define NUNCHAKU_ROCM_MFMA_INT4 1
 #endif
 
+// The same on RDNA GPUs (32-lane wavefronts) with WMMA. Not yet run on RDNA hardware.
+#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__))
+#define NUNCHAKU_ROCM_WMMA_INT4 1
+#endif
+
 // m16n8k16, f16 inputs, f16 accumulator
 __device__ __forceinline__ static uint2 mma_m16n8k16_f16f16f16f16(uint4 a, uint2 b, uint2 c) {
     const float2 c_lo = __half22float2(bit_copy<half2>(c.x));
