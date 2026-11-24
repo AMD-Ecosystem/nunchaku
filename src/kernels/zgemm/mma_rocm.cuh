@@ -124,11 +124,152 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #define NUNCHAKU_ROCM_MFMA_INT4 1
 #endif
 
+// The 16-bit floating-point products (mma_m16n16k16_* below) on CDNA matrix instructions.
+#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+#define NUNCHAKU_ROCM_MFMA_F16 1
+#endif
+
 // The same on RDNA GPUs (32-lane wavefronts) with WMMA, which also computes the 16-bit floating-point products
 // (mma_m16n16k16_* below).
 #if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__))
 #define NUNCHAKU_ROCM_WMMA_INT4 1
 #define NUNCHAKU_ROCM_WMMA_F16 1
+#endif
+
+#if defined(NUNCHAKU_ROCM_MFMA_F16) || defined(NUNCHAKU_ROCM_WMMA_F16)
+namespace mma_rocm {
+template<typename T>
+__device__ __forceinline__ static T select4(T v0, T v1, T v2, T v3, int i) {
+    return (i & 2) ? ((i & 1) ? v3 : v2) : ((i & 1) ? v1 : v0);
+}
+} // namespace mma_rocm
+#endif
+
+#ifdef NUNCHAKU_ROCM_MFMA_F16
+namespace mma_rocm {
+
+// A 16x16x16 product per 32-lane warp on a 64-lane wavefront, with the four-block 16x16x4 MFMA: block b reads
+// its A and B operands only from lanes 16b .. 16b + 15, so blocks 0 and 1 belong to the lower warp and blocks 2
+// and 3 to the upper one, and no product mixes the two warps. Each block multiplies four values of K; a warp's
+// two blocks take different K and their results are added. The results of all four blocks are spread over the
+// whole wavefront, so moving them back to the fragment layout reads lanes of both warps. All 64 lanes of the
+// wavefront must execute these functions together.
+
+// Moves a 16x16 matrix of 16-bit values from mma.sync fragment registers into the MFMA operand layout. p0, p1,
+// p2, p3 hold (index < 8, k < 8), (index >= 8, k < 8), (index < 8, k >= 8), (index >= 8, k >= 8), where index is
+// the row of A or the column of B and lane 4 * (index % 8) + t holds k 2t and 2t + 1 (+ 8). On return lane l
+// holds index l % 16 with k 8 * (l / 16) .. + 7 as four words in k order. Lane l takes its four words from one
+// source lane each, in a different step starting at word x, so that each source lane is read for one register
+// per step.
+__device__ __forceinline__ static void
+mfma_operand_words(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t (&out)[4]) {
+    const int lane = __lane_id() % 32;
+    const int x    = (lane % 16) / 8 + 2 * (lane / 16); // the register this lane takes from its sources
+    const int t    = lane % 4;
+    uint32_t v[4];
+#pragma unroll
+    for (int s = 0; s < 4; s++) {
+        v[s] = shfl_warp(select4(p0, p1, p2, p3, (t - s) & 3), 4 * (lane % 8) + ((s + x) & 3));
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        out[j] = select4(v[0], v[1], v[2], v[3], (j - x) & 3);
+    }
+}
+
+using mfma_acc_t = float __attribute__((ext_vector_type(16)));
+
+// acc += the products of the operands above: words 2s and 2s + 1 of each lane go to the instruction of step s.
+template<bool is_bf16>
+__device__ __forceinline__ static mfma_acc_t mfma_16x16x16(const uint32_t (&wa)[4], const uint32_t (&wb)[4], mfma_acc_t acc) {
+    using operand_t = std::conditional_t<is_bf16, short, _Float16> __attribute__((ext_vector_type(4)));
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const uint32_t pa[2] = {wa[2 * s], wa[2 * s + 1]};
+        const uint32_t pb[2] = {wb[2 * s], wb[2 * s + 1]};
+        const operand_t va   = __builtin_bit_cast(operand_t, pa);
+        const operand_t vb   = __builtin_bit_cast(operand_t, pb);
+        if constexpr (is_bf16) {
+            acc = __builtin_amdgcn_mfma_f32_16x16x4bf16_1k(va, vb, acc, 0, 0, 0);
+        } else {
+            acc = __builtin_amdgcn_mfma_f32_16x16x4f16(va, vb, acc, 0, 0, 0);
+        }
+    }
+    return acc;
+}
+
+// The operands of the product of an m16n8k16 A fragment a and the B fragments of columns 0-7 and 8-15, {b.x, b.y}
+// and {b.z, b.w}, in the MFMA layout.
+__device__ __forceinline__ static void mfma_operands_a(uint4 a, uint32_t (&wa)[4]) {
+    mfma_operand_words(a.x, a.y, a.z, a.w, wa);
+}
+__device__ __forceinline__ static void mfma_operands_b(uint4 b, uint32_t (&wb)[4]) {
+    mfma_operand_words(b.x, b.z, b.y, b.w, wb);
+}
+
+// Moves the m16n16 product in acc back to the accumulator fragments of columns 0-7 (d0) and 8-15 (d1).
+__device__ __forceinline__ static void mfma_result_fragments(mfma_acc_t acc, float (&d0)[4], float (&d1)[4]) {
+    // Register 4b + v of lane l: block b, row 4 * (l / 16) + v, column l % 16. The lower warp's product is
+    // blocks 0 + 1 and the upper warp's blocks 2 + 3, so lane l holds row 4 * (l / 16) + v of both in prod[w][v].
+    float prod[2][4];
+#pragma unroll
+    for (int v = 0; v < 4; v++) {
+        prod[0][v] = acc[v] + acc[4 + v];
+        prod[1][v] = acc[8 + v] + acc[12 + v];
+    }
+
+    // Lane 4g + t of warp w needs rows g + 8u (u = 0, 1) and columns 2t, 2t + 1, 2t + 8, 2t + 9 (sources c = 0..3)
+    // of prod[w], all in register g % 4 of lane 16 * (g / 4 + 2u) + column, in the lower warp's lanes for u = 0
+    // and the upper warp's for u = 1. In step (q, e) it reads source c = (q + g % 4) % 4 with u = e ^ w. A source
+    // in half h of the wavefront is read in step (q, e) only by the lane of warp e ^ h with g % 4 = (c - q) % 4,
+    // which wants that register of prod[e ^ h].
+    const int lane = __lane_id();
+    const int w    = lane / 32;
+    const int t    = lane % 4;
+    const int g    = lane % 32 / 4;
+    const int n_s  = lane % 16;
+    const int c_s  = n_s % 2 + 2 * (n_s / 8); // this lane's index as a source
+    float v[2][4];
+#pragma unroll
+    for (int e = 0; e < 2; e++) {
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+            const int c    = (q + g) & 3;
+            const int u    = e ^ w;
+            const int src  = 16 * (g / 4 + 2 * u) + 2 * t + (c & 1) + 8 * (c >> 1);
+            const int r    = (c_s - q) & 3;
+            const float s0 = select4(prod[0][0], prod[0][1], prod[0][2], prod[0][3], r);
+            const float s1 = select4(prod[1][0], prod[1][1], prod[1][2], prod[1][3], r);
+            v[e][q]        = __shfl(u ? s1 : s0, src); // as a source, this lane sends prod[e ^ w]
+        }
+    }
+    // the value from source c with row half u arrived in step ((c - g % 4) % 4, u ^ w)
+    auto from = [&](int u, int c) {
+        const int q = (c - g) & 3;
+        return (u ^ w) ? select4(v[1][0], v[1][1], v[1][2], v[1][3], q)
+                       : select4(v[0][0], v[0][1], v[0][2], v[0][3], q);
+    };
+    // fragment register order: (m = g, n = 2t), (g, 2t + 1), (g + 8, 2t), (g + 8, 2t + 1)
+    d0[0] = from(0, 0);
+    d0[1] = from(0, 1);
+    d0[2] = from(1, 0);
+    d0[3] = from(1, 1);
+    d1[0] = from(0, 2);
+    d1[1] = from(0, 3);
+    d1[2] = from(1, 2);
+    d1[3] = from(1, 3);
+}
+
+// d0 and d1 = A * B for the m16n8k16 fragments a, {b.x, b.y} and a, {b.z, b.w}, in the accumulator fragment layout.
+template<bool is_bf16>
+__device__ __forceinline__ static void mfma_m16n16k16_f32(uint4 a, uint4 b, float (&d0)[4], float (&d1)[4]) {
+    uint32_t wa[4], wb[4];
+    mfma_operands_a(a, wa);
+    mfma_operands_b(b, wb);
+    mfma_result_fragments(mfma_16x16x16<is_bf16>(wa, wb, mfma_acc_t{}), d0, d1);
+}
+
+} // namespace mma_rocm
 #endif
 
 #ifdef NUNCHAKU_ROCM_WMMA_F16
@@ -156,11 +297,6 @@ wmma_operand_words(uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t 
         out[j]     = upper ? lo[(j + 2) & 3] : lo[j];
         out[j + 4] = upper ? hi[(j + 2) & 3] : hi[j];
     }
-}
-
-template<typename T>
-__device__ __forceinline__ static T select4(T v0, T v1, T v2, T v3, int i) {
-    return (i & 2) ? ((i & 1) ? v3 : v2) : ((i & 1) ? v1 : v0);
 }
 
 // d0 and d1 = A * B for the m16n8k16 fragments a, {b.x, b.y} and a, {b.z, b.w}, in the accumulator fragment
@@ -287,14 +423,18 @@ __device__ __forceinline__ static uint4 mma_m16n8k16_f32f16f16f32(uint4 a, uint2
 }
 
 // m16n16k16 as two m16n8k16 with the same A: b holds the B fragments of columns 0-7 and 8-15, {b0.x, b0.y, b1.x,
-// b1.y}, and c0, c1 the matching accumulator fragments. With WMMA the products of each k step are summed in the
-// matrix unit's order and then added to c, so the result is not bit-identical to the reference, which adds one
+// b1.y}, and c0, c1 the matching accumulator fragments. With WMMA or MFMA the products of each k step are summed in
+// the matrix unit's order and then added to c, so the result is not bit-identical to the reference, which adds one
 // product at a time to c.
 template<bool is_bf16>
 __device__ __forceinline__ static void mma_m16n16k16_f32f16f16f32(uint4 a, uint4 b, uint4 &c0, uint4 &c1) {
-#ifdef NUNCHAKU_ROCM_WMMA_F16
+#if defined(NUNCHAKU_ROCM_WMMA_F16) || defined(NUNCHAKU_ROCM_MFMA_F16)
     float d0[4], d1[4];
+#ifdef NUNCHAKU_ROCM_WMMA_F16
     mma_rocm::wmma_m16n16k16_f32<is_bf16>(a, b, d0, d1);
+#else
+    mma_rocm::mfma_m16n16k16_f32<is_bf16>(a, b, d0, d1);
+#endif
     c0 = uint4(__float_as_uint(__uint_as_float(c0.x) + d0[0]),
                __float_as_uint(__uint_as_float(c0.y) + d0[1]),
                __float_as_uint(__uint_as_float(c0.z) + d0[2]),
@@ -311,9 +451,13 @@ __device__ __forceinline__ static void mma_m16n16k16_f32f16f16f32(uint4 a, uint4
 
 // The same with f16 accumulators: c = {c0.x, c0.y, c1.x, c1.y}.
 __device__ __forceinline__ static uint4 mma_m16n16k16_f16f16f16f16(uint4 a, uint4 b, uint4 c) {
-#ifdef NUNCHAKU_ROCM_WMMA_F16
+#if defined(NUNCHAKU_ROCM_WMMA_F16) || defined(NUNCHAKU_ROCM_MFMA_F16)
     float d0[4], d1[4];
+#ifdef NUNCHAKU_ROCM_WMMA_F16
     mma_rocm::wmma_m16n16k16_f32<false>(a, b, d0, d1);
+#else
+    mma_rocm::mfma_m16n16k16_f32<false>(a, b, d0, d1);
+#endif
     auto add = [](uint32_t c, float x, float y) {
         const float2 f = __half22float2(bit_copy<half2>(c));
         return bit_copy<uint32_t>(__float22half2_rn(make_float2(f.x + x, f.y + y)));
