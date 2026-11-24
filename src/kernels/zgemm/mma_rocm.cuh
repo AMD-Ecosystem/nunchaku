@@ -124,6 +124,12 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #define NUNCHAKU_ROCM_MFMA_INT4 1
 #endif
 
+// NVFP4 GEMM on the AMD GPUs with FP4 matrix instructions; every other AMD GPU traps on FP4, as NVIDIA GPUs before
+// sm_120 do. The FP4 values are decoded with their block scales into the 16-bit products (gemm_w4a4.cuh).
+#if defined(__gfx950__)
+#define NUNCHAKU_ROCM_FP4 1
+#endif
+
 // The 16-bit floating-point products (mma_m16n16k16_* below) on CDNA matrix instructions.
 #if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
 #define NUNCHAKU_ROCM_MFMA_F16 1

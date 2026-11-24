@@ -25,7 +25,7 @@ public:
     // micro-scales for FP4 MMA
     // each uint32_t is a 4*32 matrix of scales (for MMA of 64*32)
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200) || defined(NUNCHAKU_ROCM_FP4)
     static constexpr bool FP4_AVAILABLE = true;
 #else
     static constexpr bool FP4_AVAILABLE = false;
@@ -190,6 +190,7 @@ public:
         }
     }
 
+#ifndef USE_ROCM
     // m16n16k64 MMA
     // ida, idb in {0, 1}
     __device__ __forceinline__ static packed_f32psum_t mma_fp4(packed_act_t act,
@@ -200,9 +201,6 @@ public:
                                                                int ida,
                                                                int idb) {
         packed_f32psum_t out;
-#ifdef USE_ROCM
-        trap_no_fp4();
-#else
         asm volatile(
             "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
             "{%0, %1, %2, %3}, "
@@ -253,10 +251,142 @@ public:
               "r"(wmscale),
               "n"(0),
               "h"((short)(idb * 2 + 1)));
-#endif
         return out;
     }
+#endif
 
+#ifdef USE_ROCM
+    // NVFP4 on AMD GPUs. An e2m1 value times its ue4m3 block scale has at most 6 significant bits and lies between
+    // 2^-10 and 2688 in magnitude, so it is exact in f16, and each m16n8k64 FP4 product is computed as four
+    // m16n8k16 f16 products with f32 accumulation. Product c takes elements 2c and 2c + 1 of each 8-element
+    // register of A and B; both hold the same k at the same place, so the four products sum to the FP4 product.
+
+    // the f16 value of ue4m3 scale byte `block` of scales, in both halves
+    __device__ __forceinline__ static half2 ue4m3_to_half2(uint32_t scales, int block) {
+        const uint32_t s = (scales >> (8 * block)) & 0x7f;
+        if (s == 0x7f) {
+            return bit_copy<half2>(0x7e007e00u); // NaN
+        }
+        // s << 7 is the f16 encoding of the scale times 2^-8, for normal and subnormal scales alike
+        return __hmul2(bit_copy<half2>(s << 7 | s << 23), __floats2half2_rn(256.0f, 256.0f));
+    }
+
+    // e2m1 elements 2c and 2c + 1 of word, times scale, as f16
+    __device__ __forceinline__ static uint32_t fp4x2_to_half2(uint32_t word, int c, half2 scale) {
+        const uint32_t b = (word >> (8 * c)) & 0xff;
+        // the sign to bit 15 and the three magnitude bits to bits 9-11 give the f16 encoding of the value times 2^-14
+        const uint32_t bits = (b & 0x08) << 12 | (b & 0x07) << 9 | (b & 0x80) << 24 | (b & 0x70) << 21;
+        return bit_copy<uint32_t>(__hmul2(__hmul2(bit_copy<half2>(bits), scale), __floats2half2_rn(16384.0f, 16384.0f)));
+    }
+
+    // The four m16n8k16 A fragments of an FP4 activation tile. Rows g and g + 8 have their scales in lanes
+    // 4g + 2 * ida and 4g + 2 * ida + 1; lane 4g + t holds k 8t .. 8t + 7 (block t / 2) and 32 + 8t .. (block 2 + t / 2).
+    __device__ __forceinline__ static void decode_fp4_act(packed_act_t act, uint32_t amscale, int ida, uint4 (&out)[4]) {
+        const int laneId   = threadIdx.x % WARP_SIZE;
+        const uint32_t slo = shfl_warp(amscale, laneId / 4 * 4 + 2 * ida);
+        const uint32_t shi = shfl_warp(amscale, laneId / 4 * 4 + 2 * ida + 1);
+        const int block    = laneId % 4 / 2;
+        const half2 s[4]   = {ue4m3_to_half2(slo, block),
+                              ue4m3_to_half2(shi, block),
+                              ue4m3_to_half2(slo, block + 2),
+                              ue4m3_to_half2(shi, block + 2)};
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            out[c] = uint4(fp4x2_to_half2(act.x, c, s[0]),
+                           fp4x2_to_half2(act.y, c, s[1]),
+                           fp4x2_to_half2(act.z, c, s[2]),
+                           fp4x2_to_half2(act.w, c, s[3]));
+        }
+    }
+
+    // The same for an FP4 weight tile of 16 columns: column g of its first and second 8 columns has its scales in
+    // lanes 4g + 2 * idb and 4g + 2 * idb + 1. Each output holds the B fragments of both, {b0.x, b0.y, b1.x, b1.y}.
+    __device__ __forceinline__ static void decode_fp4_wgt(packed_wgt_t wgt, uint32_t wmscale, int idb, uint4 (&out)[4]) {
+        const int laneId  = threadIdx.x % WARP_SIZE;
+        const uint32_t s0 = shfl_warp(wmscale, laneId / 4 * 4 + 2 * idb);
+        const uint32_t s1 = shfl_warp(wmscale, laneId / 4 * 4 + 2 * idb + 1);
+        const int block   = laneId % 4 / 2;
+        const half2 s[4]  = {ue4m3_to_half2(s0, block),
+                             ue4m3_to_half2(s0, block + 2),
+                             ue4m3_to_half2(s1, block),
+                             ue4m3_to_half2(s1, block + 2)};
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            out[c] = uint4(fp4x2_to_half2(wgt.x, c, s[0]),
+                           fp4x2_to_half2(wgt.y, c, s[1]),
+                           fp4x2_to_half2(wgt.z, c, s[2]),
+                           fp4x2_to_half2(wgt.w, c, s[3]));
+        }
+    }
+
+    __device__ __forceinline__ static void
+    compute_fp4(act_warp A, wgt_warp W, amscale_warp amscale, wmscale_warp wmscale, f32psum_warp &psum) {
+        uint4 a16[WARP_M_TILES][4];
+#pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++) {
+            decode_fp4_act(A[i], amscale[i / 2 / AMSCALES_PACK_SIZE].data[i / 2 % AMSCALES_PACK_SIZE], i % 2, a16[i]);
+        }
+#ifdef NUNCHAKU_ROCM_MFMA_F16
+        // the A operands are converted once and used for every weight tile; the four products of each output
+        // tile are summed in the MFMA accumulator and added to psum once
+        uint32_t wa[WARP_M_TILES][4][4];
+#pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++) {
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                mma_rocm::mfma_operands_a(a16[i][c], wa[i][c]);
+            }
+        }
+#endif
+#pragma unroll
+        for (int j = 0; j < WARP_N_TILES; j++) {
+            uint4 b16[4];
+            decode_fp4_wgt(W[j], wmscale[j / 2 / WMSCALES_PACK_SIZE].data[j / 2 % WMSCALES_PACK_SIZE], j % 2, b16);
+#ifdef NUNCHAKU_ROCM_MFMA_F16
+            uint32_t wb[4][4];
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                mma_rocm::mfma_operands_b(b16[c], wb[c]);
+            }
+#pragma unroll
+            for (int i = 0; i < WARP_M_TILES; i++) {
+                mma_rocm::mfma_acc_t acc = {};
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    acc = mma_rocm::mfma_16x16x16<false>(wa[i][c], wb[c], acc);
+                }
+                float d0[4], d1[4];
+                mma_rocm::mfma_result_fragments(acc, d0, d1);
+                auto &out = psum[i * WARP_N_TILES + j];
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    out.data[r] += d0[r];
+                    out.data[4 + r] += d1[r];
+                }
+            }
+#else
+#pragma unroll
+            for (int i = 0; i < WARP_M_TILES; i++) {
+                auto &out = psum[i * WARP_N_TILES + j];
+                uint4 c0  = kernels::bit_cast<uint4>(std::array<float, 4>{out.data[0], out.data[1], out.data[2], out.data[3]});
+                uint4 c1  = kernels::bit_cast<uint4>(std::array<float, 4>{out.data[4], out.data[5], out.data[6], out.data[7]});
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    mma_m16n16k16_f32f16f16f32<false>(a16[i][c], b16[c], c0, c1);
+                }
+                out.data[0] = __uint_as_float(c0.x);
+                out.data[1] = __uint_as_float(c0.y);
+                out.data[2] = __uint_as_float(c0.z);
+                out.data[3] = __uint_as_float(c0.w);
+                out.data[4] = __uint_as_float(c1.x);
+                out.data[5] = __uint_as_float(c1.y);
+                out.data[6] = __uint_as_float(c1.z);
+                out.data[7] = __uint_as_float(c1.w);
+            }
+#endif
+        }
+    }
+#else
     __device__ __forceinline__ static void
     compute_fp4(act_warp A, wgt_warp W, amscale_warp amscale, wmscale_warp wmscale, f32psum_warp &psum) {
         const int laneId = threadIdx.x % WARP_SIZE;
@@ -277,6 +407,7 @@ public:
             }
         }
     }
+#endif
 
     template<typename Epilogue, bool USE_ALPHA>
     __device__ __forceinline__ static void gemm_w4a4_fp4_block(const BlockInfo binfo,

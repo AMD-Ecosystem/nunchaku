@@ -316,10 +316,37 @@ __device__ __forceinline__ uint32_t quantize_float2<8, false>(float2 value) {
 #endif
 }
 
+#ifdef USE_ROCM
+// float to e2m1, rounding to nearest even and saturating to +-6
+__device__ __forceinline__ static uint32_t float_to_e2m1_satfinite(float x) {
+    const float a       = fabsf(x);
+    const uint32_t code = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) + (a >= 3.5f) + (a > 5.0f);
+    return code | (signbit(x) ? 0x8 : 0);
+}
+
+// float to e4m3 (no infinity, 0x7f is NaN), rounding to nearest even and saturating to +-448
+__device__ __forceinline__ static uint32_t float_to_e4m3_satfinite(float x) {
+    const uint32_t sign = signbit(x) ? 0x80 : 0;
+    const float a       = fabsf(x);
+    uint32_t code;
+    if (isnan(a)) {
+        code = 0x7f;
+    } else if (a >= 448.0f) {
+        code = 0x7e;
+    } else if (a < 0.015625f) {
+        code = (uint32_t)__builtin_rintf(a * 512.0f); // subnormal steps of 2^-9; 8 is the smallest normal 2^-6
+    } else {
+        uint32_t bits = __float_as_uint(a);
+        bits += 0x7ffff + ((bits >> 20) & 1); // round the mantissa to 3 bits, carrying into the exponent
+        code = (bits >> 20) - ((127 - 7) << 3);
+    }
+    return sign | code;
+}
+#endif
+
 __device__ __forceinline__ uint32_t quantize_float2_fp4(float2 value) {
 #ifdef USE_ROCM
-    trap_unsupported_arch();
-    return 0;
+    return float_to_e2m1_satfinite(value.x) | float_to_e2m1_satfinite(value.y) << 4;
 #else
     uint32_t result;
     asm volatile("{ .reg .b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, %1, %2; cvt.u32.u8 %0, tmp; }"
@@ -331,8 +358,8 @@ __device__ __forceinline__ uint32_t quantize_float2_fp4(float2 value) {
 
 __device__ __forceinline__ uint32_t quantize_float4_fp8(float4 value) {
 #ifdef USE_ROCM
-    trap_unsupported_arch();
-    return 0;
+    return float_to_e4m3_satfinite(value.x) | float_to_e4m3_satfinite(value.y) << 8 |
+           float_to_e4m3_satfinite(value.z) << 16 | float_to_e4m3_satfinite(value.w) << 24;
 #else
     uint16_t lo, hi;
     asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(value.y), "f"(value.x));
