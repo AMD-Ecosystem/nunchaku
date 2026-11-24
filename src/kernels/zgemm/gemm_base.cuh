@@ -208,11 +208,11 @@ public:
 
         uint4 out1 = mma_m16n8k16_f32f16f16f32<is_bf16>(
             kernels::bit_cast<uint4>(a),
-            kernels::bit_cast<uint2>(std::array<half2_t, 2>(b.data[0], b.data[1])),
+            kernels::bit_cast<uint2>(std::array<half2_t, 2>{b.data[0], b.data[1]}),
             kernels::bit_cast<uint4>(float4(psum.data[0], psum.data[1], psum.data[2], psum.data[3])));
         uint4 out2 = mma_m16n8k16_f32f16f16f32<is_bf16>(
             kernels::bit_cast<uint4>(a),
-            kernels::bit_cast<uint2>(std::array<half2_t, 2>(b.data[2], b.data[3])),
+            kernels::bit_cast<uint2>(std::array<half2_t, 2>{b.data[2], b.data[3]}),
             kernels::bit_cast<uint4>(float4(psum.data[4], psum.data[5], psum.data[6], psum.data[7])));
         psum.data[0] = kernels::bit_cast<float>(out1.x);
         psum.data[1] = kernels::bit_cast<float>(out1.y);
