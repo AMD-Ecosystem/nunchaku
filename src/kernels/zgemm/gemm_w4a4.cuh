@@ -1399,7 +1399,8 @@ public:
     // The main loop of gemm_w4a4_block on RDNA WMMA (iu4 inputs, i32 accumulators); one 32-lane warp is one
     // wavefront. Operands are loaded from global memory in the WMMA layout, with the weights as the A matrix
     // (rows = output columns) and the activations as B, and each 16x16 result goes through shared memory into the
-    // mma.sync accumulator layout before the scales are applied as in apply_scales.
+    // mma.sync accumulator layout before the scales are applied as in apply_scales. gfx1250 has no 4-bit WMMA: it
+    // loads the operands as gfx12 does, widens them to 8 bits and multiplies all 64 k with one iu8 WMMA.
     template<typename Epilogue, bool ACT_UNSIGNED>
     __device__ __forceinline__ static void gemm_w4a4_block_wmma(const BlockInfo binfo,
                                                                 const packed_act_t *act,
@@ -1413,11 +1414,11 @@ public:
                                                                 bool alwaysfalse) {
         static_assert(WARP_SIZE == 32 && INSN_K == 64);
         constexpr int NUM_STAGES = 2;
-        constexpr int NUM_STEPS  = INSN_K / 16; // k elements per WMMA: 16
+        constexpr int NUM_STEPS  = INSN_K / 16; // k elements per WMMA: 16 (gfx1250: per operand word)
 #if defined(__GFX11__)
         constexpr int WORDS = 2; // gfx11: each lane holds all 16 k of its row (lanes 16-31 repeat lanes 0-15)
 #else
-        constexpr int WORDS = 1; // gfx12: lanes 0-15 hold k 0-7, lanes 16-31 hold k 8-15
+        constexpr int WORDS = 1; // gfx12 and gfx1250: lanes 0-15 hold k 0-7, lanes 16-31 hold k 8-15
 #endif
 
         const int laneId = threadIdx.x % WARP_SIZE;
@@ -1521,6 +1522,11 @@ public:
 #pragma unroll
                     for (int i = 0; i < WARP_M_TILES; i++) {
                         int __attribute__((ext_vector_type(8))) acc = {};
+#if defined(__gfx1250__)
+                        const uint32_t a[4] = {W[k2][j][0][0], W[k2][j][1][0], W[k2][j][2][0], W[k2][j][3][0]};
+                        const uint32_t b[4] = {A[k2][i][0][0], A[k2][i][1][0], A[k2][i][2][0], A[k2][i][3][0]};
+                        acc                 = mma_rocm::wmma_i32_16x16x64_int4<false, ACT_UNSIGNED>(a, b);
+#else
 #pragma unroll
                         for (int s = 0; s < NUM_STEPS; s++) {
 #if defined(__GFX11__)
@@ -1534,6 +1540,7 @@ public:
                                 true, (int)W[k2][j][s][0], !ACT_UNSIGNED, (int)A[k2][i][s][0], acc, false);
 #endif
                         }
+#endif
 
 #pragma unroll
                         for (int v = 0; v < 8; v++) {

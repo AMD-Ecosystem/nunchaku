@@ -899,6 +899,11 @@ constexpr int max_arch() {
 }
 
 template<typename kernel, typename... T>
+#if defined(__gfx1250__)
+// Every kernel launched through here uses at most 256 threads. Saying so lets gfx1250 waves use the VGPRs of a
+// 256-thread block instead of the 128 per wave left for a block of 1024 threads, which made these kernels spill.
+__launch_bounds__(256)
+#endif
 __global__ static void invoke_kernel(T... args) {
 #ifdef __CUDA_ARCH__
     if constexpr (__CUDA_ARCH__ >= min_arch<kernel>() && __CUDA_ARCH__ <= max_arch<kernel>()) {

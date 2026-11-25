@@ -139,9 +139,10 @@ __device__ __forceinline__ static uint64_t widen_int4x8(uint32_t word) {
 #define NUNCHAKU_ROCM_MFMA_F16 1
 #endif
 
-// The same on RDNA GPUs (32-lane wavefronts) with WMMA, which also computes the 16-bit floating-point products
-// (mma_m16n16k16_* below). gfx1250 has none of the 16x16x16 WMMA forms used here and takes the reference path.
-#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__)) && !defined(__gfx1250__)
+// The same on RDNA GPUs and gfx1250 (32-lane wavefronts) with WMMA, which also computes the 16-bit floating-point
+// products (mma_m16n16k16_* below). gfx1250 has none of the 16x16x16 WMMA forms: it widens INT4 to 8 bits for its
+// 16x16x64 iu8 WMMA and computes the 16-bit products with its 16x16x32 WMMA, the upper half of K zero.
+#if !defined(NUNCHAKU_ROCM_MMA_REFERENCE) && (defined(__GFX11__) || defined(__GFX12__))
 #define NUNCHAKU_ROCM_WMMA_INT4 1
 #define NUNCHAKU_ROCM_WMMA_F16 1
 #endif
@@ -339,13 +340,30 @@ __device__ __forceinline__ static void wmma_m16n16k16_f32(uint4 a, uint4 b, floa
 #else
     // lanes 0-15 hold k 0-7, lanes 16-31 k 8-15; result register v of lane l: row n = v + 8 * (l / 16), column m
     // = l % 16
+#if defined(__gfx1250__)
+    // gfx1250 has only the 16x16x32 form: words 0-3 of each lane hold k 8 * (l / 16) .. + 7 as on gfx12, words 4-7
+    // hold k 16 + 8 * (l / 16) .. + 7 and are zero; same result layout as gfx12
+    using operand_t = std::conditional_t<is_bf16, __bf16, _Float16> __attribute__((ext_vector_type(16)));
+#else
     using operand_t = std::conditional_t<is_bf16, short, _Float16> __attribute__((ext_vector_type(8)));
+#endif
     uint32_t ha[4], hb[4];
 #pragma unroll
     for (int j = 0; j < 4; j++) {
         ha[j] = lane < 16 ? wa[j] : wa[j + 4];
         hb[j] = lane < 16 ? wb[j] : wb[j + 4];
     }
+#if defined(__gfx1250__)
+    const uint32_t pa[8] = {ha[0], ha[1], ha[2], ha[3], 0, 0, 0, 0};
+    const uint32_t pb[8] = {hb[0], hb[1], hb[2], hb[3], 0, 0, 0, 0};
+    const operand_t va   = __builtin_bit_cast(operand_t, pa);
+    const operand_t vb   = __builtin_bit_cast(operand_t, pb);
+    if constexpr (is_bf16) {
+        acc = __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, va, false, vb, (short)0, acc, false, false);
+    } else {
+        acc = __builtin_amdgcn_wmma_f32_16x16x32_f16(false, va, false, vb, (short)0, acc, false, false);
+    }
+#else
     const operand_t va = __builtin_bit_cast(operand_t, ha);
     const operand_t vb = __builtin_bit_cast(operand_t, hb);
     if constexpr (is_bf16) {
@@ -353,6 +371,7 @@ __device__ __forceinline__ static void wmma_m16n16k16_f32(uint4 a, uint4 b, floa
     } else {
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(va, vb, acc);
     }
+#endif
 #endif
 
     // Lane 4g + t needs rows m = g, g + 8 and columns n = 2t, 2t + 1, 2t + 8, 2t + 9, held by the four lanes
@@ -406,6 +425,31 @@ __device__ __forceinline__ static void wmma_m16n16k16_f32(uint4 a, uint4 b, floa
 #endif
 }
 
+} // namespace mma_rocm
+#endif
+
+#if defined(NUNCHAKU_ROCM_WMMA_INT4) && defined(__gfx1250__)
+namespace mma_rocm {
+// A 16x16x64 product of 4-bit integers on the gfx1250 iu8 WMMA, which has no 4-bit form. a[s] and b[s] hold the
+// eight 4-bit values k 16s + 8 * (l / 16) .. + 7 of row l % 16 of A and column l % 16 of B; they are widened to
+// bytes in the same order, so words 2s and 2s + 1 of each operand hold the k the instruction takes there. Result
+// register v of lane l: row 8 * (l / 16) + v, column l % 16.
+template<bool a_unsigned, bool b_unsigned>
+__device__ __forceinline__ static int __attribute__((ext_vector_type(8)))
+wmma_i32_16x16x64_int4(const uint32_t (&a)[4], const uint32_t (&b)[4]) {
+    int __attribute__((ext_vector_type(8))) va, vb;
+#pragma unroll
+    for (int s = 0; s < 4; s++) {
+        const uint64_t wa = widen_int4x8<a_unsigned>(a[s]);
+        const uint64_t wb = widen_int4x8<b_unsigned>(b[s]);
+        va[2 * s]         = (int)wa;
+        va[2 * s + 1]     = (int)(wa >> 32);
+        vb[2 * s]         = (int)wb;
+        vb[2 * s + 1]     = (int)(wb >> 32);
+    }
+    return __builtin_amdgcn_wmma_i32_16x16x64_iu8(
+        !a_unsigned, va, !b_unsigned, vb, (int __attribute__((ext_vector_type(8)))){}, false, false);
+}
 } // namespace mma_rocm
 #endif
 
