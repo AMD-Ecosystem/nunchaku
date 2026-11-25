@@ -3,11 +3,14 @@
 No GPU is used: the device capability (CUDA) or architecture (ROCm) is replaced, so this runs on any backend.
 """
 
+import json
 import types
 
 import pytest
 import torch
 
+from nunchaku import NunchakuFluxTransformer2dModel
+from nunchaku.models.transformers import transformer_flux
 from nunchaku.utils import get_checkpoint_precision, get_precision
 
 
@@ -93,3 +96,53 @@ def test_unknown_dtype_falls_back(fake_device):
     config = quantization_config("int4")
     config["weight"]["dtype"] = "int8"
     assert get_checkpoint_precision(config) == get_precision() == "int4"
+
+
+# device -> precision NunchakuFluxTransformer2dModel builds an int4 and an fp4 single-file checkpoint with
+# (None: rejected by check_hardware_compatibility)
+FLUX_EXPECTED = {
+    ("cuda", (7, 5)): ("int4", None),
+    ("cuda", (8, 0)): ("int4", None),
+    ("cuda", (8, 6)): ("int4", None),
+    ("cuda", (8, 9)): ("int4", None),
+    ("cuda", (9, 0)): (None, None),
+    ("cuda", (10, 0)): (None, None),
+    ("cuda", (12, 0)): (None, "fp4"),
+    ("cuda", (12, 1)): (None, "fp4"),
+    ("rocm", "gfx90a"): ("int4", None),
+    ("rocm", "gfx942"): ("int4", None),
+    ("rocm", "gfx950"): ("int4", "fp4"),
+    ("rocm", "gfx1100"): ("int4", None),
+    ("rocm", "gfx1201"): ("int4", None),
+    ("rocm", "gfx1250"): ("int4", "fp4"),
+}
+
+
+class Built(Exception):
+    """Stops NunchakuFluxTransformer2dModel.from_pretrained where it builds the quantized model."""
+
+
+@pytest.mark.parametrize("kind,device", list(FLUX_EXPECTED))
+def test_flux_loader_precision(fake_device, monkeypatch, kind, device):
+    """The FLUX loader takes a supported checkpoint's precision; on NVIDIA GPUs that is always get_precision()'s."""
+    fake_device(kind, device)
+
+    def build_model(cls, path, **kwargs):
+        return types.SimpleNamespace(), {}, {"quantization_config": json.dumps(CHECKPOINTS[path.stem])}
+
+    def load_quantized_module(*args, use_fp4, **kwargs):
+        raise Built("fp4" if use_fp4 else "int4")
+
+    monkeypatch.setattr(NunchakuFluxTransformer2dModel, "_build_model", classmethod(build_model))
+    monkeypatch.setattr(transformer_flux, "load_quantized_module", load_quantized_module)
+    got = []
+    for name in ("int4", "fp4"):
+        try:
+            NunchakuFluxTransformer2dModel.from_pretrained(f"{name}.safetensors")
+        except Built as built:
+            got.append(str(built))
+        except ValueError:
+            got.append(None)
+    assert tuple(got) == FLUX_EXPECTED[kind, device]
+    if kind == "cuda":
+        assert all(precision in (None, get_precision()) for precision in got)
