@@ -181,7 +181,7 @@ Building for AMD GPUs (ROCm)
 
 Nunchaku also builds as a HIP extension for AMD GPUs with a ROCm build of PyTorch (2.7 or newer).
 The INT4 kernels use the matrix instructions of CDNA GPUs (MFMA: ``gfx90a``, ``gfx942``, ``gfx950``) and RDNA GPUs (WMMA: ``gfx11``, ``gfx12``).
-INT4 models run on every supported AMD GPU. The NVFP4 kernels also run on ``gfx950``, but ``get_precision()`` returns ``int4`` on AMD GPUs, so the model loaders, which take the precision from it, use the INT4 checkpoints.
+INT4 models run on every supported AMD GPU, and NVFP4 models also run on ``gfx950``: the model loaders take the precision from the checkpoint when the GPU supports it. ``get_precision()`` returns ``int4`` on AMD GPUs, so code that chooses a checkpoint by its result, as the examples do, uses the INT4 checkpoints.
 Block-sparse attention is not available on ROCm, and the ``flashattn2`` attention option runs through PyTorch's ``scaled_dot_product_attention``.
 
 .. code-block:: shell

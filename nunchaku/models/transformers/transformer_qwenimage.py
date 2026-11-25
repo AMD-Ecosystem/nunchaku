@@ -21,7 +21,7 @@ from diffusers.models.transformers.transformer_qwenimage import (
 from diffusers.utils import logging as diffusers_logging
 from huggingface_hub import utils
 
-from ...utils import get_precision
+from ...utils import get_checkpoint_precision
 from ..attention import NunchakuBaseAttention, NunchakuFeedForward
 from ..attention_processors.qwenimage import NunchakuQwenImageNaiveFA2Processor
 from ..linear import AWQW4A16Linear, SVDQW4A4Linear
@@ -394,7 +394,7 @@ class NunchakuQwenImageTransformer2DModel(QwenImageTransformer2DModel, NunchakuM
         rank = quantization_config.get("rank", 32)
         transformer = transformer.to(torch_dtype)
 
-        precision = get_precision()
+        precision = get_checkpoint_precision(quantization_config)
         if precision == "fp4":
             precision = "nvfp4"
         transformer._patch_model(precision=precision, rank=rank)

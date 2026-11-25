@@ -357,6 +357,34 @@ def check_hardware_compatibility(quantization_config: dict, device: str | torch.
         )
 
 
+def get_checkpoint_precision(quantization_config: dict) -> str:
+    """
+    Determine the precision to load a quantized checkpoint with.
+
+    This is the checkpoint's own precision when the current GPU supports it
+    (see :func:`check_hardware_compatibility`), and otherwise the GPU's default from :func:`get_precision`.
+
+    Parameters
+    ----------
+    quantization_config : dict
+        Quantization configuration from the checkpoint metadata (may be empty).
+
+    Returns
+    -------
+    str
+        The selected precision ("int4" or "fp4").
+    """
+    dtype = quantization_config.get("weight", {}).get("dtype")
+    precision = {"int4": "int4", "fp4_e2m1_all": "fp4"}.get(dtype)
+    if precision is not None:
+        try:
+            check_hardware_compatibility(quantization_config)
+            return precision
+        except ValueError:
+            pass
+    return get_precision()
+
+
 def get_precision_from_quantization_config(quantization_config: dict) -> str:
     """
     Get the precision from the quantization configuration.
